@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller intermediate artifacts (dist/ exe IS committed deliberately)
+build/
+
+# Local rclone state / credentials — never commit
+rclone.conf
+*.log
