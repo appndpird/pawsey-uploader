@@ -1,10 +1,42 @@
-# Python
+# --- Pawsey Uploader: never commit credentials or runtime state ---
+.pawsey_uploader/
+config.json
+*.rclone.conf
+rclone.conf
+heartbeat.json
+resume.json
+transfer_log.jsonl
+last_transfer.json
+bisync_pairs.json
+logs/
+
+# --- old / numbered working copies of the script (keep only pawsey_uploader.py) ---
+pawsey_uploader[0-9]*.py
+pawsey_uploader-old.py
+pawsey_uploader_backup*.py
+
+# --- PyInstaller / build artifacts ---
+build/
 __pycache__/
 *.pyc
+*.pyo
 
-# PyInstaller intermediate artifacts (dist/ exe IS committed deliberately)
-build/
+# dist/ is ignored EXCEPT the shipped Windows executable (committed deliberately)
+dist/*
+!dist/PawseyUploader.exe
 
-# Local rclone state / credentials — never commit
-rclone.conf
+# --- bundled rclone binary / archive (don't ship it in the repo) ---
+rclone
+rclone.exe
+rclone-*/
+rclone-*.zip
+*.zip
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
 *.log
