@@ -43,7 +43,7 @@ from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Pawsey Uploader"
-APP_VERSION = "1.1"
+APP_VERSION = "1.4"
 
 APP_DIR = Path.home() / ".pawsey_uploader"
 CONFIG_FILE = APP_DIR / "config.json"
