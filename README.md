@@ -9,6 +9,11 @@ It does one-way copies, exact mirrors, and OneDrive-style **two-way sync**, with
 a soft-delete recycle bin, conflict resolution, scheduled auto-sync, and
 crash-resilient unattended operation for transfers that run for days.
 
+It also gives you Windows-style **copy / cut / paste** of files and folders on
+Pawsey, expiring **shareable links**, a built-in **command console**, and a
+**dry-run preview** mode — all behind a light, professional UI branded for
+**DPIRD** (primary, left) and **APPN** (top-right).
+
 ## Two ways to use it
 
 ### A) Run as a Python script (simplest)
@@ -76,6 +81,11 @@ Pick a mode on the **Transfer** tab:
   number of files (guards against an accidental mass deletion).
 * **Auto-sync (Two-way) every N minutes** — re-runs the sync on a timer, like
   OneDrive, after the first successful run.
+* **Preview only (dry-run)** — tick this to have rclone report exactly what it
+  *would* copy, change or delete **without transferring or deleting anything**.
+  Ideal for sanity-checking a Mirror or two-way sync before committing. (For
+  the record: with this box unticked, every transfer is a real, live run — the
+  app never silently does a dry-run.)
 
 ## Unattended / long-running transfers
 
@@ -95,6 +105,11 @@ The app is designed to be left running for days:
 
 | Feature | Where to find it |
 |---|---|
+| **Multiple Pawsey projects** — save several projects (each its own keys), mark one active, switch any time | Settings tab → Pawsey projects |
+| **Copy / Cut / Paste** files & folders on Pawsey (Windows-style; server-side move/copy, no re-upload) | Storage tab |
+| **Generate shareable link** with a user-chosen expiry (file → one link; folder/bucket → an HTML page of links) | Storage tab → "🔗 Generate link…" |
+| **Command console** — run any rclone (or other) command and watch live output | Console tab |
+| **Preview (dry-run)** — show changes without transferring | Transfer tab → Sync options |
 | Configure / edit Pawsey remote (access key, secret, endpoint) | Settings tab |
 | Editable default project / bucket / source folder | Settings tab → Defaults |
 | Performance tuning (transfers, checkers, S3 chunk size, upload concurrency) | Settings tab |
@@ -143,10 +158,79 @@ On Linux, restrict permissions: `chmod 600 ~/.pawsey_uploader/config.json`
 ## Files in this folder
 
 ```
-pawsey_uploader.py     # the app
-build_exe.bat          # one-click Windows build script
-build_linux.sh         # one-click Linux build script
-PawseyUploader.spec    # PyInstaller build spec
-dist/PawseyUploader.exe # prebuilt Windows executable
-README.md              # this file
+pawsey_uploader.py          # the app
+logo_data.py                # embedded DPIRD + APPN logos (base64 PNG); bundled automatically
+build_exe.bat               # one-click Windows build script
+build_linux.sh              # one-click Linux build script
+PawseyUploader.spec         # PyInstaller build spec
+dist/PawseyUploader.exe     # prebuilt Windows executable — always the LATEST version
+dist/PawseyUploader-v1.6.exe # retained previous version
+dist/PawseyUploader-v1.4.exe # retained older version
+README.md                   # this file
 ```
+
+## Versions — which `.exe` to download
+
+The header was rebranded in **v1.7**: the **DPIRD** logo is now the larger,
+primary mark on the left and **APPN** sits top-right. Previous releases are kept
+alongside so you can always roll back or compare:
+
+| File | Version | Notes |
+|---|---|---|
+| `dist/PawseyUploader.exe` | **v1.7 (latest)** | DPIRD-primary header; everything below |
+| `dist/PawseyUploader-v1.6.exe` | v1.6 | Multi-project management, presigned share pages |
+| `dist/PawseyUploader-v1.4.exe` | v1.4 | Two-way sync, recycle bin, unattended operation |
+
+`PawseyUploader.exe` (no version suffix) is **always the latest build**. The
+running app shows its version in the title bar and on the Help tab, so you can
+confirm which one you launched.
+
+## Multiple Pawsey projects
+
+Each Pawsey project is its own set of Acacia keys. On the **Settings → Pawsey
+projects** panel you can save several projects (each is an rclone S3 remote),
+**Test** any of them, and **Set as active** so all tabs default to it (the
+active project is marked ★). You'll usually work in one project at a time, but
+having more than one lets you **copy data from one project to another**:
+
+* On the **Storage** tab — Copy/Cut in one project, switch the Remote dropdown
+  to the other, then Paste.
+* Or on the **Console** — `copy projectA:bucket projectB:bucket -P`.
+
+If the two projects use different keys, the data streams **through your
+machine** (download then upload), not server-side — so run large migrations on
+a Pawsey/Nimbus VM. To access **someone else's** project you need an access
+key + secret with permission on their bucket(s); the cleanest route is to be
+added to their project (make your own keys) or have them grant your existing
+key bucket access via a policy (which also enables fast server-side copies).
+
+Existing single-remote setups are migrated into this panel automatically on
+first launch — nothing to redo.
+
+## Sharing links — how it works
+
+Pawsey Acacia is Ceph S3 storage, and rclone's `link` command does **not**
+support expiring public links on S3. So "🔗 Generate link…" instead builds a
+**presigned URL**: a normal HTTPS link with a time-limited signature baked in,
+generated locally from your stored access key/secret (no third-party packages).
+Every link **works from any browser, anywhere — no Pawsey account needed** by
+the recipient.
+
+* **A file** → one presigned URL, copied to your clipboard. Send it to anyone.
+* **A folder or bucket** → the app builds a small **file-browser web page**
+  (expand folders/subfolders, view or download any file, or download a whole
+  folder with one click), **uploads that page into the bucket** under a
+  `_shares/` prefix, and gives you a **single presigned link to the page**.
+  Send that one link — it opens the browser for the recipient. The page and
+  every link inside it expire together.
+
+You choose the validity (minutes / hours / days). S3's hard maximum is **7 days**;
+longer requests are capped to that. Anyone with a link can access that data
+until it expires, so don't post them publicly unless that's intended.
+
+> Folder downloads: the browser saves each file individually into the
+> recipient's Downloads folder (the original folder path is preserved in each
+> file's name). A single static link can't recreate directories or zip large
+> research datasets reliably, so per-file downloads are used instead. Share
+> pages accumulate under `_shares/` in the bucket — delete them from the
+> Storage tab whenever you like.

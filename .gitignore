@@ -21,9 +21,12 @@ __pycache__/
 *.pyc
 *.pyo
 
-# dist/ is ignored EXCEPT the shipped Windows executable (committed deliberately)
+# dist/ is ignored EXCEPT the shipped Windows executables (committed deliberately).
+# PawseyUploader.exe is always the LATEST version; PawseyUploader-v<x.y>.exe are
+# the retained previous versions so users can tell releases apart.
 dist/*
 !dist/PawseyUploader.exe
+!dist/PawseyUploader-v*.exe
 
 # --- bundled rclone binary / archive (don't ship it in the repo) ---
 rclone

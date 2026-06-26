@@ -22,6 +22,9 @@ Run with:  python pawsey_uploader.py
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import platform
@@ -30,20 +33,49 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
-from datetime import datetime
+import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
+try:
+    # Embedded brand logos (base64 PNG). Optional: the app still runs if the
+    # module is missing (the header just omits the logos).
+    import logo_data
+except Exception:  # pragma: no cover - logos are cosmetic
+    logo_data = None
+
 # ---------------------------------------------------------------------------
 # Constants & defaults
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Pawsey Uploader"
-APP_VERSION = "1.4"
+APP_VERSION = "1.7"
+APP_TAGLINE = "DPIRD · APPN  |  Pawsey Acacia object storage manager"
+
+# ---------------------------------------------------------------------------
+# Light "DPIRD teal" theme palette
+# ---------------------------------------------------------------------------
+THEME = {
+    "bg":          "#F4F6F8",   # window / tab background (very light grey)
+    "surface":     "#FFFFFF",   # cards, header, entries
+    "surface_alt": "#EDF1F4",   # subtle panel / hover
+    "border":      "#D5DCE2",   # hairline borders
+    "text":        "#1F2A33",   # primary text (dark slate)
+    "text_muted":  "#5B6B78",   # secondary text
+    "accent":      "#1A6B8A",   # DPIRD teal/blue - primary actions, active tab
+    "accent_dark": "#13556E",   # pressed / hover-darker
+    "accent_soft": "#E1EEF3",   # tinted selection / accent wash
+    "danger":      "#B22222",   # destructive actions
+    "danger_dark": "#8E1B1B",
+    "success":     "#2E7D32",   # ok / completed
+    "warning":     "#B26B00",
+}
 
 APP_DIR = Path.home() / ".pawsey_uploader"
 CONFIG_FILE = APP_DIR / "config.json"
@@ -110,6 +142,12 @@ DEFAULT_CONFIG = {
     "secret_access_key": "",
     "endpoint": "https://projects.pawsey.org.au",
     "provider": "Ceph",
+    # Multi-project support: each saved project is one rclone S3 remote.
+    # projects = { "<remote_name>": {endpoint, access_key_id,
+    #              secret_access_key, provider, label} }
+    # active_project names the one used as the app-wide default.
+    "projects": {},
+    "active_project": "",
     "default_project": "",
     "default_bucket": "sample-data",
     "default_source": "",
@@ -309,6 +347,110 @@ def human_bytes(n: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# S3 presigned-URL generation (AWS Signature V4) - standard library only.
+#
+# Pawsey Acacia is a Ceph S3 backend; rclone's `link` command does NOT support
+# expiring public links on S3. The S3-native equivalent is a *presigned URL*:
+# a normal HTTPS link that embeds a time-limited signature, after which it
+# stops working. We build it here with hmac/hashlib so the app keeps its
+# "no third-party packages" promise.
+# ---------------------------------------------------------------------------
+
+# Max lifetime SigV4 allows for a presigned URL.
+PRESIGN_MAX_SECONDS = 7 * 24 * 3600  # 7 days
+
+
+def _sigv4_uri_encode(value: str, encode_slash: bool) -> str:
+    """AWS-style percent-encoding (unreserved chars stay literal)."""
+    safe = "-_.~"
+    if not encode_slash:
+        safe += "/"
+    return urllib.parse.quote(value, safe=safe)
+
+
+def _hmac(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def s3_presign_url(endpoint: str, region: str, access_key: str,
+                   secret_key: str, bucket: str, key: str,
+                   expires: int, *, now: Optional[datetime] = None,
+                   download_name: Optional[str] = None,
+                   content_type: Optional[str] = None) -> str:
+    """Return a time-limited presigned GET URL for endpoint/bucket/key.
+
+    Uses path-style addressing (endpoint/bucket/key), which is what Ceph/RGW
+    and rclone's default Pawsey config use. `expires` is in seconds and is
+    clamped to the SigV4 maximum of 7 days.
+
+    If `download_name` is given, a signed `response-content-disposition` query
+    param is added so the browser saves the object as an attachment with that
+    filename (used for "download" links and folder bulk-downloads). Without it
+    the link opens inline in the browser (used for "view" links).
+    """
+    expires = max(1, min(int(expires), PRESIGN_MAX_SECONDS))
+    region = region or "us-east-1"
+    service = "s3"
+    endpoint = endpoint.rstrip("/")
+    parsed = urllib.parse.urlsplit(endpoint)
+    host = parsed.netloc
+    scheme = parsed.scheme or "https"
+
+    dt = now or datetime.now(timezone.utc)
+    amzdate = dt.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = dt.strftime("%Y%m%d")
+
+    # Canonical URI: path-style /bucket/key with each key segment encoded.
+    key = key.lstrip("/")
+    canonical_uri = "/" + _sigv4_uri_encode(bucket, True)
+    if key:
+        canonical_uri += "/" + _sigv4_uri_encode(key, False)
+
+    credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+    qs = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access_key}/{credential_scope}",
+        "X-Amz-Date": amzdate,
+        "X-Amz-Expires": str(expires),
+        "X-Amz-SignedHeaders": "host",
+    }
+    if download_name:
+        # Strip characters that don't belong in a Content-Disposition filename.
+        safe_name = download_name.replace('"', "").replace("\\", "_")
+        qs["response-content-disposition"] = (
+            f'attachment; filename="{safe_name}"')
+    if content_type:
+        # Force how the browser interprets the object (e.g. render the share
+        # page as text/html regardless of what was stored on upload).
+        qs["response-content-type"] = content_type
+    canonical_qs = "&".join(
+        f"{_sigv4_uri_encode(k, True)}={_sigv4_uri_encode(v, True)}"
+        for k, v in sorted(qs.items())
+    )
+    canonical_headers = f"host:{host}\n"
+    signed_headers = "host"
+    payload_hash = "UNSIGNED-PAYLOAD"
+    canonical_request = "\n".join([
+        "GET", canonical_uri, canonical_qs,
+        canonical_headers, signed_headers, payload_hash,
+    ])
+
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amzdate, credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+
+    k_date = _hmac(("AWS4" + secret_key).encode("utf-8"), datestamp)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, service)
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(
+        k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    return f"{scheme}://{host}{canonical_uri}?{canonical_qs}&X-Amz-Signature={signature}"
+
+
+# ---------------------------------------------------------------------------
 # Config manager
 # ---------------------------------------------------------------------------
 
@@ -356,16 +498,15 @@ class RcloneRemote:
         return [line.rstrip(":") for line in out.splitlines() if line.strip()]
 
     @staticmethod
-    def upsert_pawsey_remote(cfg: ConfigManager) -> tuple[bool, str]:
-        """Create or update the Pawsey remote based on app config."""
-        name = cfg.get("remote_name", "pawsey")
-        endpoint = cfg.get("endpoint")
-        access = cfg.get("access_key_id")
-        secret = cfg.get("secret_access_key")
-        provider = cfg.get("provider", "Ceph")
-
+    def upsert_remote(name: str, endpoint: str, access: str, secret: str,
+                      provider: str = "Ceph") -> tuple[bool, str]:
+        """Create or update an S3 remote (one Pawsey project) in rclone.conf."""
+        name = (name or "").strip()
         if not (access and secret and endpoint and name):
-            return False, "Remote name, endpoint, access key, and secret are all required."
+            return False, "Project name, endpoint, access key, and secret are all required."
+        if not name.replace("_", "").replace("-", "").isalnum():
+            return False, ("Project (remote) name can only contain letters, "
+                           "numbers, '-' and '_' (no spaces).")
 
         existing = RcloneRemote.list_remotes()
         is_update = name in existing
@@ -378,7 +519,7 @@ class RcloneRemote:
         if not is_update:
             args.append("s3")                  # backend type, create only
         args.extend([
-            "provider",          provider,
+            "provider",          provider or "Ceph",
             "endpoint",          endpoint,
             "access_key_id",     access,
             "secret_access_key", secret,
@@ -390,7 +531,24 @@ class RcloneRemote:
             verb = "update" if is_update else "create"
             return False, f"rclone {verb} failed:\n{out}"
         verb = "updated" if is_update else "created"
-        return True, f"Remote '{name}' {verb} successfully."
+        return True, f"Project '{name}' {verb} successfully."
+
+    @staticmethod
+    def delete_remote(name: str) -> tuple[bool, str]:
+        """Remove a remote from rclone.conf."""
+        rc, out = run_rclone_capture(
+            ["config", "delete", name], timeout=30)
+        if rc != 0:
+            return False, out
+        return True, f"Removed '{name}'."
+
+    @staticmethod
+    def upsert_pawsey_remote(cfg: ConfigManager) -> tuple[bool, str]:
+        """Create or update the active Pawsey remote based on app config."""
+        return RcloneRemote.upsert_remote(
+            cfg.get("remote_name", "pawsey"), cfg.get("endpoint"),
+            cfg.get("access_key_id"), cfg.get("secret_access_key"),
+            cfg.get("provider", "Ceph"))
 
     @staticmethod
     def show(name: str) -> str:
@@ -554,6 +712,7 @@ class PawseyApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.cfg = ConfigManager()
+        self._migrate_projects()
         self.proc: Optional[subprocess.Popen] = None
         self.proc_queue: queue.Queue[str] = queue.Queue()
         self.proc_thread: Optional[threading.Thread] = None
@@ -595,18 +754,11 @@ class PawseyApp:
         self._resolve_rclone_executable(prompt_if_missing=True)
 
         root.title(f"{APP_NAME} v{APP_VERSION}")
-        root.geometry("1050x760")
-        root.minsize(900, 640)
+        root.geometry("1120x800")
+        root.minsize(940, 660)
+        self._logo_images = {}   # keep PhotoImage refs alive
 
-        # Use a clean ttk theme
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("Danger.TButton", foreground="#a40000")
-        style.configure("Big.TLabel", font=("TkDefaultFont", 11, "bold"))
-
+        self._apply_theme()
         self._build_ui()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -662,14 +814,182 @@ class PawseyApp:
         messagebox.showinfo(APP_NAME, f"Using rclone at:\n{path}")
         return True
 
+    # --------------------------------------------------------------- theming
+    def _apply_theme(self) -> None:
+        """Apply the light DPIRD-teal theme to the root window and all ttk
+        widgets. Built on the 'clam' base theme (the only stock ttk theme that
+        honours custom colours consistently across Windows and Linux)."""
+        T = THEME
+        self.root.configure(bg=T["bg"])
+        try:
+            self.root.option_add("*Font", ("Segoe UI", 10))
+        except Exception:
+            pass
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        base_font = ("Segoe UI", 10)
+        bold_font = ("Segoe UI", 10, "bold")
+
+        # --- Frames / labels -------------------------------------------------
+        style.configure(".", background=T["bg"], foreground=T["text"],
+                        fieldbackground=T["surface"], font=base_font,
+                        bordercolor=T["border"])
+        style.configure("TFrame", background=T["bg"])
+        style.configure("Surface.TFrame", background=T["surface"])
+        style.configure("Header.TFrame", background=T["surface"])
+        style.configure("TLabel", background=T["bg"], foreground=T["text"])
+        style.configure("Surface.TLabel", background=T["surface"], foreground=T["text"])
+        style.configure("Big.TLabel", font=("Segoe UI", 11, "bold"),
+                        background=T["bg"], foreground=T["text"])
+        style.configure("Muted.TLabel", foreground=T["text_muted"], background=T["bg"])
+        style.configure("HeaderTitle.TLabel", background=T["surface"],
+                        foreground=T["accent"], font=("Segoe UI Semibold", 17, "bold"))
+        style.configure("HeaderSub.TLabel", background=T["surface"],
+                        foreground=T["text_muted"], font=("Segoe UI", 9))
+
+        # --- Notebook (tabs) -------------------------------------------------
+        style.configure("TNotebook", background=T["bg"], borderwidth=0,
+                        tabmargins=(6, 4, 6, 0))
+        style.configure("TNotebook.Tab", background=T["surface_alt"],
+                        foreground=T["text_muted"], padding=(18, 8),
+                        font=base_font, borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", T["accent"]), ("active", T["accent_soft"])],
+                  foreground=[("selected", "#FFFFFF"), ("active", T["accent_dark"])])
+
+        # --- Buttons ---------------------------------------------------------
+        style.configure("TButton", background=T["surface"], foreground=T["text"],
+                        bordercolor=T["border"], focuscolor=T["accent_soft"],
+                        padding=(12, 6), font=base_font, relief="flat")
+        style.map("TButton",
+                  background=[("active", T["surface_alt"]), ("pressed", T["border"])],
+                  bordercolor=[("active", T["accent"])])
+        # Primary (accent) button
+        style.configure("Accent.TButton", background=T["accent"], foreground="#FFFFFF",
+                        bordercolor=T["accent"], padding=(14, 7), font=bold_font,
+                        relief="flat")
+        style.map("Accent.TButton",
+                  background=[("active", T["accent_dark"]), ("pressed", T["accent_dark"]),
+                              ("disabled", T["border"])],
+                  foreground=[("disabled", T["text_muted"])])
+        # Destructive button
+        style.configure("Danger.TButton", background=T["surface"],
+                        foreground=T["danger"], bordercolor=T["danger"],
+                        padding=(12, 6), font=bold_font, relief="flat")
+        style.map("Danger.TButton",
+                  background=[("active", "#F6E6E6"), ("pressed", "#EFD3D3")],
+                  foreground=[("active", T["danger_dark"])])
+
+        # --- Inputs ----------------------------------------------------------
+        for cls in ("TEntry", "TCombobox", "TSpinbox"):
+            style.configure(cls, fieldbackground=T["surface"], foreground=T["text"],
+                            bordercolor=T["border"], arrowcolor=T["accent"],
+                            insertcolor=T["text"], padding=4)
+            style.map(cls, bordercolor=[("focus", T["accent"])],
+                      fieldbackground=[("readonly", T["surface_alt"])])
+
+        # --- Checkbuttons / radiobuttons ------------------------------------
+        for cls in ("TCheckbutton", "TRadiobutton"):
+            style.configure(cls, background=T["bg"], foreground=T["text"],
+                            focuscolor=T["bg"])
+            style.map(cls, background=[("active", T["bg"])],
+                      indicatorcolor=[("selected", T["accent"])])
+
+        # --- LabelFrame ------------------------------------------------------
+        style.configure("TLabelframe", background=T["bg"], bordercolor=T["border"],
+                        relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=T["bg"],
+                        foreground=T["accent"], font=bold_font)
+
+        # --- Treeview --------------------------------------------------------
+        style.configure("Treeview", background=T["surface"],
+                        fieldbackground=T["surface"], foreground=T["text"],
+                        bordercolor=T["border"], rowheight=24, font=base_font)
+        style.configure("Treeview.Heading", background=T["surface_alt"],
+                        foreground=T["text"], font=bold_font, relief="flat",
+                        padding=(6, 4))
+        style.map("Treeview.Heading", background=[("active", T["accent_soft"])])
+        style.map("Treeview",
+                  background=[("selected", T["accent"])],
+                  foreground=[("selected", "#FFFFFF")])
+
+        # --- Progress / scrollbar / separator -------------------------------
+        style.configure("TProgressbar", background=T["accent"],
+                        troughcolor=T["surface_alt"], bordercolor=T["border"])
+        style.configure("Horizontal.TProgressbar", background=T["accent"],
+                        troughcolor=T["surface_alt"], bordercolor=T["border"])
+        style.configure("TScrollbar", background=T["surface_alt"],
+                        troughcolor=T["bg"], bordercolor=T["border"],
+                        arrowcolor=T["text_muted"])
+        style.configure("TSeparator", background=T["border"])
+        style.configure("Accent.TSeparator", background=T["accent"])
+
+        # --- Status bar ------------------------------------------------------
+        style.configure("Status.TLabel", background=T["surface_alt"],
+                        foreground=T["text_muted"], font=("Segoe UI", 9))
+
+    def _make_logo(self, key: str, b64: str, max_h: int = 44):
+        """Decode an embedded base64 PNG into a PhotoImage and cache it."""
+        try:
+            img = tk.PhotoImage(data=base64.b64decode(b64))
+            # PhotoImage can only integer-subsample; shrink if taller than max_h
+            if img.height() > max_h:
+                factor = max(1, round(img.height() / max_h))
+                img = img.subsample(factor, factor)
+            self._logo_images[key] = img
+            return img
+        except Exception:
+            return None
+
+    def _build_header(self) -> None:
+        """White brand header: DPIRD logo (primary, left) + APPN logo (right),
+        app title, teal accent rule."""
+        T = THEME
+        header = tk.Frame(self.root, bg=T["surface"])
+        header.pack(fill="x", side="top")
+
+        inner = tk.Frame(header, bg=T["surface"])
+        inner.pack(fill="x", padx=16, pady=8)
+
+        # DPIRD logo (left, primary) - this is foremost a DPIRD app
+        if logo_data is not None:
+            dpird = self._make_logo("dpird", logo_data.DPIRD_LOGO_PNG_B64, max_h=64)
+            if dpird is not None:
+                tk.Label(inner, image=dpird, bg=T["surface"]).pack(side="left", padx=(0, 16))
+
+        # Title block (centre-left)
+        titlebox = tk.Frame(inner, bg=T["surface"])
+        titlebox.pack(side="left")
+        tk.Label(titlebox, text=APP_NAME, bg=T["surface"], fg=T["accent"],
+                 font=("Segoe UI Semibold", 17, "bold")).pack(anchor="w")
+        tk.Label(titlebox, text=APP_TAGLINE, bg=T["surface"], fg=T["text_muted"],
+                 font=("Segoe UI", 9)).pack(anchor="w")
+
+        # APPN logo (top-right), matched height to DPIRD
+        if logo_data is not None:
+            appn = self._make_logo("appn", logo_data.APPN_LOGO_PNG_B64, max_h=64)
+            if appn is not None:
+                tk.Label(inner, image=appn, bg=T["surface"]).pack(side="right", anchor="n")
+
+        # Teal accent rule under the header
+        tk.Frame(self.root, bg=T["accent"], height=3).pack(fill="x", side="top")
+
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
+        self._build_header()
+
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
 
         self.tab_transfer = ttk.Frame(nb)
         self.tab_buckets = ttk.Frame(nb)
         self.tab_storage = ttk.Frame(nb)
+        self.tab_console = ttk.Frame(nb)
         self.tab_history = ttk.Frame(nb)
         self.tab_settings = ttk.Frame(nb)
         self.tab_help = ttk.Frame(nb)
@@ -677,6 +997,7 @@ class PawseyApp:
         nb.add(self.tab_transfer, text="  Transfer  ")
         nb.add(self.tab_buckets, text="  Buckets  ")
         nb.add(self.tab_storage, text="  Storage  ")
+        nb.add(self.tab_console, text="  Console  ")
         nb.add(self.tab_history, text="  History  ")
         nb.add(self.tab_settings, text="  Settings  ")
         nb.add(self.tab_help, text="  Help  ")
@@ -687,11 +1008,13 @@ class PawseyApp:
         bar = ttk.Frame(self.root)
         bar.pack(fill="x", side="bottom")
         ttk.Separator(bar, orient="horizontal").pack(fill="x")
-        ttk.Label(bar, textvariable=self.status_var, anchor="w", padding=(8, 4)).pack(fill="x")
+        ttk.Label(bar, textvariable=self.status_var, anchor="w",
+                  style="Status.TLabel", padding=(10, 5)).pack(fill="x")
 
         self._build_transfer_tab()
         self._build_buckets_tab()
         self._build_storage_tab()
+        self._build_console_tab()
         self._build_history_tab()
         self._build_settings_tab()
         self._build_help_tab()
@@ -821,6 +1144,15 @@ class PawseyApp:
             command=self._on_recycle_toggle).grid(
             row=3, column=2, sticky="w", padx=8, pady=(0, 6))
 
+        # Preview / dry-run: rclone reports what WOULD change but transfers
+        # nothing. Lets users sanity-check a Mirror or two-way sync first.
+        self.dry_run = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opts,
+            text="Preview only (dry-run — show changes, transfer nothing)",
+            variable=self.dry_run).grid(
+            row=5, column=2, sticky="w", padx=8, pady=(0, 6))
+
         # Deletion safety cap (two-way sync). Adjustable, and can be turned
         # off. When on, a sync that would delete more than this percentage of
         # files on either side is aborted before any data is removed.
@@ -879,8 +1211,8 @@ class PawseyApp:
                         variable=self.mode_var, value="resume",
                         command=self._on_mode_change).pack(side="left", padx=2)
 
-        ttk.Button(mode_frame, text="Start transfer", command=self._start_transfer).pack(
-            side="right", padx=(8, 0))
+        ttk.Button(mode_frame, text="Start transfer", style="Accent.TButton",
+                   command=self._start_transfer).pack(side="right", padx=(8, 0))
         self.stop_btn = ttk.Button(mode_frame, text="Stop", command=self._stop_transfer,
                                    state="disabled")
         self.stop_btn.pack(side="right")
@@ -1083,6 +1415,7 @@ class PawseyApp:
         conflict = self._conflict_choice()
         track = bool(self.track_renames.get()) if hasattr(self, "track_renames") else False
         recycle = bool(self.use_recycle_bin.get()) if hasattr(self, "use_recycle_bin") else False
+        dry = bool(self.dry_run.get()) if hasattr(self, "dry_run") else False
         bwlimit = str(self.cfg.get("bwlimit", "")).strip()
 
         if mode == "bisync":
@@ -1130,6 +1463,8 @@ class PawseyApp:
                 cmd += ["--compare", "size,modtime,checksum"]
             if bwlimit:
                 cmd += ["--bwlimit", bwlimit]
+            if dry:
+                cmd += ["--dry-run"]
             cmd += ["--progress", "--stats=5s", "-v"]
             return cmd
 
@@ -1169,6 +1504,8 @@ class PawseyApp:
             cmd += ["--checksum"]
         if bwlimit:
             cmd += ["--bwlimit", bwlimit]
+        if dry:
+            cmd += ["--dry-run"]
         cmd += ["--progress", "--stats=5s", "-v"]
         return cmd
 
@@ -2312,9 +2649,9 @@ class PawseyApp:
             t,
             text="Click ▶ to expand a bucket or folder. Select an item (or "
                  "several with Ctrl+click / Shift+click), then use the buttons "
-                 "below to upload, download or delete. Notes are required for "
-                 "any change.",
-            foreground="#555", wraplength=1000, justify="left",
+                 "below to copy / cut / paste, share a link, upload, download, "
+                 "rename or delete. Notes are required for any change.",
+            style="Muted.TLabel", wraplength=1040, justify="left",
         ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
 
         # ----- Summary line -----
@@ -2375,27 +2712,50 @@ class PawseyApp:
         self.storage_notes = scrolledtext.ScrolledText(bottom, height=2, wrap="word")
         self.storage_notes.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
 
+        # Row 1: organise on Pawsey (clipboard + share + rename)
         btns = ttk.Frame(bottom)
-        btns.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
-        ttk.Button(btns, text="Upload file…",
-                   command=self._storage_upload_file).pack(side="left", padx=2)
-        ttk.Button(btns, text="Upload folder…",
-                   command=self._storage_upload_folder).pack(side="left", padx=2)
-        ttk.Button(btns, text="New folder…",
-                   command=self._storage_new_folder).pack(side="left", padx=2)
+        btns.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 2))
+        ttk.Button(btns, text="Copy",
+                   command=self._storage_copy).pack(side="left", padx=2)
+        ttk.Button(btns, text="Cut",
+                   command=self._storage_cut).pack(side="left", padx=2)
+        self.storage_paste_btn = ttk.Button(
+            btns, text="Paste here", command=self._storage_paste,
+            style="Accent.TButton", state="disabled")
+        self.storage_paste_btn.pack(side="left", padx=2)
+        ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(btns, text="🔗 Generate link…",
+                   command=self._storage_generate_link).pack(side="left", padx=2)
         ttk.Button(btns, text="Rename / Move…",
                    command=self._storage_rename_move).pack(side="left", padx=2)
-        ttk.Button(btns, text="Download…",
+        ttk.Button(btns, text="New folder…",
+                   command=self._storage_new_folder).pack(side="left", padx=2)
+        # Clipboard status (right-aligned)
+        self.storage_clip_label = ttk.Label(
+            btns, text="Clipboard: empty", style="Muted.TLabel")
+        self.storage_clip_label.pack(side="right", padx=4)
+
+        # Row 2: transfer & remove
+        btns2 = ttk.Frame(bottom)
+        btns2.grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 8))
+        ttk.Button(btns2, text="Upload file…",
+                   command=self._storage_upload_file).pack(side="left", padx=2)
+        ttk.Button(btns2, text="Upload folder…",
+                   command=self._storage_upload_folder).pack(side="left", padx=2)
+        ttk.Button(btns2, text="Download…",
                    command=self._storage_download_selected).pack(side="left", padx=12)
-        ttk.Button(btns, text="Delete selected",
+        ttk.Button(btns2, text="Delete selected",
                    command=self._storage_delete_selected,
                    style="Danger.TButton").pack(side="left", padx=12)
-        ttk.Button(btns, text="Recycle bin…",
+        ttk.Button(btns2, text="Recycle bin…",
                    command=self._storage_recycle_manager).pack(side="left", padx=2)
 
         # ----- State -----
         self._tree_loaded: set[str] = set()      # iids whose children are populated
         self._tree_sizes: dict[str, int] = {}    # iid (incl. nested) -> bytes
+        # Clipboard for copy/cut/paste on Pawsey: {"op": "copy"|"cut",
+        # "remote": str, "items": [(iid, type), ...]}
+        self._storage_clipboard: Optional[dict] = None
 
         # Populate remote dropdown now
         remotes = RcloneRemote.list_remotes()
@@ -3299,6 +3659,642 @@ class PawseyApp:
 
         self._bg_call(work, done)
 
+    # ===== Copy / Cut / Paste (Windows-style, server-side on Pawsey) ======
+
+    def _update_clip_ui(self) -> None:
+        """Refresh the clipboard status label and Paste button state."""
+        clip = self._storage_clipboard
+        if not clip or not clip.get("items"):
+            self.storage_clip_label.configure(text="Clipboard: empty")
+            self.storage_paste_btn.configure(state="disabled")
+            return
+        verb = "Copy" if clip["op"] == "copy" else "Cut"
+        n = len(clip["items"])
+        first = clip["items"][0][0].split("/")[-1] or clip["items"][0][0]
+        label = first if n == 1 else f"{n} items"
+        self.storage_clip_label.configure(
+            text=f"Clipboard: {verb} → {label}")
+        self.storage_paste_btn.configure(state="normal")
+
+    def _storage_set_clipboard(self, op: str) -> None:
+        items = self._storage_selected_items()
+        # Buckets can't be copied/moved as objects; block clearly.
+        items = [(r, i, t) for (r, i, t) in items if t != "bucket"]
+        if not items:
+            messagebox.showinfo(
+                APP_NAME,
+                "Select one or more files/folders to "
+                f"{'copy' if op == 'copy' else 'cut'} first.\n\n"
+                "(Whole buckets can't be copied/cut — make a new bucket and "
+                "paste contents into it instead.)")
+            return
+        remote = items[0][0]
+        self._storage_clipboard = {
+            "op": op, "remote": remote,
+            "items": [(i, t) for (_r, i, t) in items],
+        }
+        self._update_clip_ui()
+        verb = "Copied" if op == "copy" else "Cut"
+        self.status_var.set(
+            f"{verb} {len(items)} item(s) to clipboard — select a destination "
+            f"folder/bucket and click 'Paste here'.")
+
+    def _storage_copy(self) -> None:
+        self._storage_set_clipboard("copy")
+
+    def _storage_cut(self) -> None:
+        self._storage_set_clipboard("cut")
+
+    def _storage_paste(self) -> None:
+        """Paste clipboard items into the selected folder/bucket. Same-remote
+        operations are server-side on Pawsey (no download/re-upload)."""
+        clip = self._storage_clipboard
+        if not clip or not clip.get("items"):
+            messagebox.showinfo(APP_NAME, "Clipboard is empty.")
+            return
+        notes = self._check_notes()
+        if not notes:
+            return
+        # Destination = selected bucket or folder (file → its parent folder).
+        sel = self._storage_selection()
+        if not sel:
+            messagebox.showerror(
+                APP_NAME, "Select the destination bucket or folder to paste into.")
+            return
+        dest_remote, dest_iid, dest_type = sel
+        if dest_type == "file":
+            dest_iid = "/".join(dest_iid.split("/")[:-1])
+        if not dest_iid:
+            messagebox.showerror(APP_NAME, "Pick a bucket or folder to paste into.")
+            return
+
+        op = clip["op"]
+        src_remote = clip["remote"]
+        items = clip["items"]
+
+        # Guard: don't paste a folder into itself or its own subtree.
+        for iid, type_ in items:
+            if type_ != "file":
+                if dest_iid == iid or dest_iid.startswith(iid + "/"):
+                    messagebox.showerror(
+                        APP_NAME,
+                        f"Can't paste '{iid.split('/')[-1]}' into itself or one "
+                        f"of its own subfolders.")
+                    return
+            # No-op move into the same parent
+            parent = "/".join(iid.split("/")[:-1])
+            if op == "cut" and dest_remote == src_remote and parent == dest_iid:
+                messagebox.showinfo(
+                    APP_NAME, f"'{iid.split('/')[-1]}' is already in that folder.")
+                return
+
+        same_remote = (src_remote == dest_remote)
+        verb_word = "Copy" if op == "copy" else "Move"
+        kind = "server-side on Pawsey (no data transfer)" if same_remote \
+            else "between remotes (data is transferred)"
+        names = ", ".join(i.split("/")[-1] for i, _ in items[:5])
+        if len(items) > 5:
+            names += f", … (+{len(items) - 5} more)"
+        if not messagebox.askyesno(
+                f"Confirm paste ({verb_word.lower()})",
+                f"{verb_word} {len(items)} item(s) {kind}:\n\n"
+                f"  {names}\n\n"
+                f"  INTO:  {dest_remote}:{dest_iid}/\n\nContinue?"):
+            return
+
+        self.status_var.set(f"{verb_word}ing {len(items)} item(s)…")
+        self._append_log({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "operation": f"paste_{op}",
+            "source": f"{src_remote}: {[i for i, _ in items]}",
+            "destination": f"{dest_remote}:{dest_iid}",
+            "notes": notes,
+            "status": "started",
+        })
+
+        def work():
+            results = []
+            for iid, type_ in items:
+                base = iid.split("/")[-1]
+                src_full = f"{src_remote}:{iid}"
+                dest_full = f"{dest_remote}:{dest_iid}/{base}"
+                if op == "copy":
+                    if type_ == "file":
+                        args = ["copyto", src_full, dest_full]
+                    else:
+                        args = ["copy", src_full, dest_full]
+                else:  # cut → move
+                    if type_ == "file":
+                        args = ["moveto", src_full, dest_full]
+                    else:
+                        args = ["move", src_full, dest_full,
+                                "--delete-empty-src-dirs"]
+                args += ["--s3-no-check-bucket"]
+                rc, out = run_rclone_capture(args, timeout=86400)
+                results.append((iid, rc, out))
+            return results
+
+        def done(results, err):
+            if err:
+                messagebox.showerror(APP_NAME, f"Paste error:\n{err}")
+                self.status_var.set("Paste failed.")
+                return
+            failed = [(iid, out) for (iid, rc, out) in results if rc != 0]
+            self._append_log({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "operation": f"paste_{op}",
+                "destination": f"{dest_remote}:{dest_iid}",
+                "status": "completed" if not failed else "partial",
+                "failed": len(failed),
+            })
+            self.storage_notes.delete("1.0", "end")
+            # A copy stays on the clipboard (like Windows); a cut is consumed.
+            if op == "cut":
+                self._storage_clipboard = None
+                self._update_clip_ui()
+            # Refresh destination and (for cut) the source parents.
+            self._refresh_subtree(dest_iid)
+            if op == "cut":
+                for iid, _t in items:
+                    parent = "/".join(iid.split("/")[:-1])
+                    if parent and parent != dest_iid:
+                        self._refresh_subtree(parent)
+            self._refresh_history()
+            if failed:
+                msg = "\n".join(f"  • {iid}: {out.strip()[:200]}"
+                                for iid, out in failed)
+                messagebox.showwarning(
+                    APP_NAME,
+                    f"{len(results) - len(failed)} of {len(results)} pasted; "
+                    f"{len(failed)} failed:\n\n{msg}")
+                self.status_var.set(f"Paste finished with {len(failed)} error(s).")
+            else:
+                self.status_var.set(
+                    f"Pasted {len(results)} item(s) into {dest_iid}.")
+                messagebox.showinfo(
+                    APP_NAME,
+                    f"Done — {verb_word.lower()}d {len(results)} item(s) into:\n"
+                    f"{dest_remote}:{dest_iid}/")
+
+        self._bg_call(work, done)
+
+    # ===== Generate shareable (presigned) link ============================
+
+    def _remote_s3_params(self, remote: str) -> Optional[dict]:
+        """Pull S3 credentials/endpoint for `remote` from rclone's own config
+        (so it works for any S3 remote, not just the saved Pawsey one)."""
+        rc, out = run_rclone_capture(["config", "dump"], timeout=30)
+        if rc != 0:
+            return None
+        try:
+            data = json.loads(out or "{}")
+        except Exception:
+            return None
+        r = data.get(remote) or {}
+        access = r.get("access_key_id") or self.cfg.get("access_key_id", "")
+        secret = r.get("secret_access_key") or self.cfg.get("secret_access_key", "")
+        endpoint = r.get("endpoint") or self.cfg.get("endpoint", "")
+        region = r.get("region") or "us-east-1"
+        if not (access and secret and endpoint):
+            return None
+        return {"access": access, "secret": secret,
+                "endpoint": endpoint, "region": region}
+
+    def _ask_link_expiry(self) -> Optional[int]:
+        """Modal dialog: choose how long the share link stays valid.
+        Returns seconds, or None if cancelled."""
+        T = THEME
+        win = tk.Toplevel(self.root)
+        win.title("Link validity")
+        win.configure(bg=T["bg"])
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.grab_set()
+        result = {"secs": None}
+
+        frm = ttk.Frame(win, padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="How long should the share link work?",
+                  style="Big.TLabel").grid(row=0, column=0, columnspan=3,
+                                           sticky="w", pady=(0, 10))
+
+        amount = tk.IntVar(value=7)
+        unit = tk.StringVar(value="days")
+        sp = ttk.Spinbox(frm, from_=1, to=999, textvariable=amount, width=6)
+        sp.grid(row=1, column=0, sticky="w")
+        cb = ttk.Combobox(frm, textvariable=unit, width=10, state="readonly",
+                          values=["minutes", "hours", "days"])
+        cb.grid(row=1, column=1, sticky="w", padx=(8, 0))
+
+        ttk.Label(frm, text="After this time the link stops working. Maximum "
+                            "allowed by S3 is 7 days.",
+                  style="Muted.TLabel", wraplength=320, justify="left").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(10, 12))
+
+        def ok():
+            mult = {"minutes": 60, "hours": 3600, "days": 86400}[unit.get()]
+            try:
+                secs = int(amount.get()) * mult
+            except Exception:
+                secs = 0
+            if secs <= 0:
+                messagebox.showerror(APP_NAME, "Enter a positive duration.",
+                                     parent=win)
+                return
+            if secs > PRESIGN_MAX_SECONDS:
+                messagebox.showinfo(
+                    APP_NAME,
+                    "S3 presigned links can last at most 7 days; capping at 7 days.",
+                    parent=win)
+                secs = PRESIGN_MAX_SECONDS
+            result["secs"] = secs
+            win.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=3, sticky="e")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=4)
+        ttk.Button(btns, text="Generate link", style="Accent.TButton",
+                   command=ok).pack(side="right", padx=4)
+        win.bind("<Return>", lambda e: ok())
+        win.bind("<Escape>", lambda e: win.destroy())
+        sp.focus_set()
+        self.root.wait_window(win)
+        return result["secs"]
+
+    def _storage_generate_link(self) -> None:
+        """Create an expiring shareable link for the selected file, folder or
+        bucket. A file → one presigned URL (copied to the clipboard). A folder
+        or bucket → a local HTML page of presigned links for every file under
+        it, which the user can share/host."""
+        sel = self._storage_selection()
+        if not sel:
+            messagebox.showerror(
+                APP_NAME, "Select a file, folder or bucket to share first.")
+            return
+        remote, iid, type_ = sel
+        params = self._remote_s3_params(remote)
+        if not params:
+            messagebox.showerror(
+                APP_NAME,
+                f"Couldn't read S3 credentials for remote '{remote}'.\n\n"
+                "Generate links needs the access key, secret and endpoint. "
+                "Configure the remote on the Settings tab (or in rclone) first.")
+            return
+
+        expires = self._ask_link_expiry()
+        if not expires:
+            return
+
+        bucket = iid.split("/")[0]
+        key = iid[len(bucket) + 1:]  # '' for a whole bucket
+
+        if type_ == "file":
+            url = s3_presign_url(
+                params["endpoint"], params["region"], params["access"],
+                params["secret"], bucket, key, expires)
+            self._show_single_link(url, iid, expires)
+            self._append_log({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "operation": "share_link_file",
+                "source": f"{remote}:{iid}",
+                "expires_seconds": expires,
+                "status": "completed",
+            })
+            self._refresh_history()
+        else:
+            self._generate_folder_links(remote, bucket, key, iid, params, expires)
+
+    def _show_single_link(self, url: str, iid: str, expires: int,
+                          description: Optional[str] = None) -> None:
+        """Show an expiring presigned URL with a Copy button. `description`
+        explains what the link is (file vs browseable folder page)."""
+        T = THEME
+        win = tk.Toplevel(self.root)
+        win.title("Shareable link")
+        win.configure(bg=T["bg"])
+        win.transient(self.root)
+        win.grab_set()
+        frm = ttk.Frame(win, padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Shareable link (works anywhere, expiring)",
+                  style="Big.TLabel").pack(anchor="w")
+        if description is None:
+            description = (f"Direct link to this file. Send it to anyone — it "
+                           f"opens in any browser, no Pawsey account needed, "
+                           f"and expires in {self._human_duration(expires)}.")
+        ttk.Label(frm, text=f"{iid}", style="Muted.TLabel").pack(anchor="w", pady=(2, 2))
+        ttk.Label(frm, text=description, style="Muted.TLabel",
+                  wraplength=620, justify="left").pack(anchor="w", pady=(0, 8))
+        txt = scrolledtext.ScrolledText(frm, height=4, width=86, wrap="char")
+        txt.insert("1.0", url)
+        txt.configure(state="normal")
+        txt.pack(fill="both", expand=True)
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            self.status_var.set("Link copied to clipboard.")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="Copy to clipboard", style="Accent.TButton",
+                   command=copy).pack(side="left")
+        ttk.Button(btns, text="Open in browser",
+                   command=lambda: self._open_url(url)).pack(side="left", padx=6)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+        copy()  # copy immediately for convenience
+
+    def _generate_folder_links(self, remote, bucket, key, iid, params, expires):
+        """Make ONE shareable link for a whole folder/bucket that works from any
+        browser, anywhere. We build a self-contained HTML 'file browser' (expand
+        folders, view/download any file, download a whole folder at once),
+        UPLOAD it into the bucket under `_shares/`, and presign that page. The
+        single URL we hand back renders the browser for the recipient; the page
+        and every link inside it expire together."""
+        self.status_var.set(f"Building shareable page for {iid}…")
+        src = f"{remote}:{iid}"
+        prefix = key.rstrip("/")
+
+        def work():
+            # List files, skipping our own share pages and the recycle bin.
+            rc, out = run_rclone_capture(
+                ["lsjson", src, "-R", "--files-only", "--no-modtime",
+                 "--exclude", "_shares/**",
+                 "--exclude", f"{RECYCLE_PREFIX}/**"],
+                timeout=900)
+            if rc != 0:
+                return ("error", out)
+            try:
+                listing = json.loads(out or "[]")
+            except Exception as e:
+                return ("error", str(e))
+            if not listing:
+                return ("empty", None)
+            # Presign two URLs per file (inline 'view' + attachment 'download').
+            files = []
+            for f in listing:
+                rel = f.get("Path", "")
+                if not rel:
+                    continue
+                full_key = f"{prefix}/{rel}" if prefix else rel
+                view = s3_presign_url(
+                    params["endpoint"], params["region"], params["access"],
+                    params["secret"], bucket, full_key, expires)
+                dl = s3_presign_url(
+                    params["endpoint"], params["region"], params["access"],
+                    params["secret"], bucket, full_key, expires,
+                    download_name=rel.replace("/", "_"))
+                files.append({"p": rel, "s": f.get("Size", 0) or 0,
+                              "v": view, "d": dl})
+            total = sum(f["s"] for f in files)
+
+            # Build the page and upload it INTO the bucket so the link is public.
+            html = self._build_links_html(iid, files, expires, total)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            label = (prefix or bucket).rstrip("/").split("/")[-1] or "root"
+            page_key = f"_shares/{label}_{ts}.html"
+            tmp = Path(tempfile.gettempdir()) / f"pawsey_share_{ts}.html"
+            try:
+                tmp.write_text(html, encoding="utf-8")
+            except Exception as e:
+                return ("error", f"Could not write temp page: {e}")
+            page_dest = f"{remote}:{bucket}/{page_key}"
+            rc2, out2 = run_rclone_capture(
+                ["copyto", str(tmp), page_dest, "--s3-no-check-bucket",
+                 "--header-upload", "Content-Type: text/html; charset=utf-8"],
+                timeout=300)
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+            if rc2 != 0:
+                return ("error", f"Could not upload the share page:\n{out2}")
+            # Presign the page itself, forcing it to render as HTML in-browser.
+            page_url = s3_presign_url(
+                params["endpoint"], params["region"], params["access"],
+                params["secret"], bucket, page_key, expires,
+                content_type="text/html; charset=utf-8")
+            return ("ok", {"url": page_url, "n": len(files),
+                           "total": total, "page_key": page_key})
+
+        def done(result, err):
+            if err:
+                messagebox.showerror(APP_NAME, f"Link generation failed:\n{err}")
+                self.status_var.set("Link generation failed.")
+                return
+            status, payload = result
+            if status == "error":
+                messagebox.showerror(APP_NAME, f"Could not create link:\n{payload}")
+                self.status_var.set("Link generation failed.")
+                return
+            if status == "empty":
+                messagebox.showinfo(APP_NAME, "No files found under that folder.")
+                self.status_var.set("Ready")
+                return
+            self._append_log({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "operation": "share_link_folder",
+                "source": src,
+                "destination": f"{remote}:{bucket}/{payload['page_key']}",
+                "files": payload["n"],
+                "expires_seconds": expires,
+                "status": "completed",
+            })
+            self._refresh_history()
+            self.status_var.set(
+                f"Shareable link ready for {payload['n']} file(s).")
+            self._show_single_link(
+                payload["url"], iid, expires,
+                description=(
+                    f"Browseable page · {payload['n']} file(s), "
+                    f"{human_bytes(payload['total'])}. Send this one link to "
+                    f"anyone — it opens in any browser and lets them view or "
+                    f"download files, or download whole folders. It works "
+                    f"everywhere and expires in {self._human_duration(expires)}."))
+
+        self._bg_call(work, done)
+
+    @staticmethod
+    def _human_duration(secs: int) -> str:
+        if secs % 86400 == 0:
+            d = secs // 86400
+            return f"{d} day" + ("s" if d != 1 else "")
+        if secs % 3600 == 0:
+            h = secs // 3600
+            return f"{h} hour" + ("s" if h != 1 else "")
+        m = max(1, secs // 60)
+        return f"{m} minute" + ("s" if m != 1 else "")
+
+    def _build_links_html(self, title_path, files, expires, total) -> str:
+        """Self-contained file-browser page: expandable folder tree, view or
+        download any file, and one-click recursive download of any folder."""
+        T = THEME
+        from html import escape
+        generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Embed the file list as JSON; neutralise any "</script>" in the data.
+        data = json.dumps(files, separators=(",", ":")).replace("<", "\\u003c")
+        return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared files — {escape(title_path)}</title>
+<style>
+ :root{{--accent:{T['accent']};--accent-dark:{T['accent_dark']};
+   --border:{T['border']};--muted:{T['text_muted']}}}
+ *{{box-sizing:border-box}}
+ body{{font-family:'Segoe UI',Arial,sans-serif;background:{T['bg']};
+   color:{T['text']};margin:0}}
+ header{{background:#fff;border-bottom:3px solid var(--accent);padding:16px 28px}}
+ h1{{margin:0;font-size:20px;color:var(--accent)}}
+ .meta{{color:var(--muted);font-size:13px;margin-top:4px}}
+ main{{padding:16px 28px;max-width:1100px}}
+ .toolbar{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}}
+ input.filter{{flex:1;min-width:180px;padding:8px 10px;border:1px solid var(--border);
+   border-radius:6px;font-size:14px}}
+ button{{font:inherit;cursor:pointer;border:1px solid var(--accent);background:var(--accent);
+   color:#fff;padding:7px 12px;border-radius:6px}}
+ button:hover{{background:var(--accent-dark)}}
+ button.ghost{{background:#fff;color:var(--accent)}}
+ button.ghost:hover{{background:{T['accent_soft']}}}
+ .tree{{background:#fff;border:1px solid var(--border);border-radius:8px;
+   box-shadow:0 1px 3px rgba(0,0,0,.06);overflow:hidden}}
+ details{{border-top:1px solid {T['surface_alt']}}}
+ details>summary{{list-style:none;cursor:pointer;padding:8px 12px;display:flex;
+   align-items:center;gap:8px;user-select:none}}
+ details>summary::-webkit-details-marker{{display:none}}
+ summary:hover{{background:{T['surface_alt']}}}
+ .caret{{transition:transform .15s;color:var(--muted)}}
+ details[open]>summary .caret{{transform:rotate(90deg)}}
+ .fname{{flex:1;font-weight:600}}
+ .count{{color:var(--muted);font-size:12px;font-weight:400}}
+ .children{{padding-left:20px;border-left:2px solid {T['surface_alt']};margin-left:18px}}
+ .file{{display:flex;align-items:center;gap:8px;padding:6px 12px;
+   border-top:1px solid {T['surface_alt']}}}
+ .file .nm{{flex:1}}
+ .file a{{color:var(--accent);text-decoration:none}}
+ .file a:hover{{text-decoration:underline}}
+ .sz{{color:var(--muted);font-size:12px;white-space:nowrap;min-width:80px;text-align:right}}
+ .mini{{padding:3px 8px;font-size:12px}}
+ .note{{color:{T['warning']};font-size:13px;margin-top:16px;line-height:1.5}}
+ #toast{{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);
+   background:{T['text']};color:#fff;padding:10px 18px;border-radius:8px;
+   font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none}}
+ #toast.show{{opacity:.95}}
+</style></head><body>
+<header>
+  <h1>📦 Shared files — {escape(title_path)}</h1>
+  <div class="meta">Generated {generated} · {len(files)} file(s) · {human_bytes(total)}
+    · links valid for {self._human_duration(expires)} from generation.</div>
+</header>
+<main>
+  <div class="toolbar">
+    <button onclick="dl('')">⬇ Download everything ({len(files)} files)</button>
+    <input class="filter" placeholder="Filter by name…" oninput="filt(this.value)">
+  </div>
+  <div id="tree" class="tree"></div>
+  <p class="note">⚠ These are time-limited links — anyone with this page can
+   download these files until the links expire. Don't post it publicly unless
+   that's intended.<br>
+   ℹ Clicking a folder's “Download folder” downloads every file beneath it
+   (all subfolders included). Your browser saves them individually into your
+   Downloads folder; the original folder path is kept in each file's name.
+   Allow “multiple downloads” if your browser asks.</p>
+</main>
+<div id="toast"></div>
+<script>
+const FILES = {data};
+// ---- build nested tree from "a/b/c.txt" paths ----
+const root = {{dirs:{{}}, files:[]}};
+for (const f of FILES) {{
+  const parts = f.p.split('/'); let node = root;
+  for (let i=0;i<parts.length-1;i++) {{
+    node.dirs[parts[i]] = node.dirs[parts[i]] || {{dirs:{{}}, files:[]}};
+    node = node.dirs[parts[i]];
+  }}
+  node.files.push(f);
+}}
+function countFiles(node) {{
+  let n = node.files.length;
+  for (const k in node.dirs) n += countFiles(node.dirs[k]);
+  return n;
+}}
+function sizeOf(node) {{
+  let s = node.files.reduce((a,f)=>a+f.s,0);
+  for (const k in node.dirs) s += sizeOf(node.dirs[k]);
+  return s;
+}}
+function hb(n) {{
+  const u=['B','KB','MB','GB','TB']; let i=0;
+  while (n>=1024 && i<u.length-1) {{ n/=1024; i++; }}
+  return n.toFixed(i?1:0)+' '+u[i];
+}}
+function esc(s) {{ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }}
+function renderDir(node, prefix) {{
+  let html = '';
+  const names = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
+  for (const name of names) {{
+    const child = node.dirs[name];
+    const full = prefix ? prefix+'/'+name : name;
+    const n = countFiles(child);
+    html += `<details data-path="${{esc(full)}}">`
+      + `<summary><span class="caret">▶</span>`
+      + `<span class="fname">📁 ${{esc(name)}}</span>`
+      + `<span class="count">${{n}} file${{n!=1?'s':''}} · ${{hb(sizeOf(child))}}</span>`
+      + `<button class="ghost mini" onclick="event.preventDefault();dl('${{esc(full)}}')">⬇ Download folder</button>`
+      + `</summary><div class="children">${{renderDir(child, full)}}</div></details>`;
+  }}
+  const fs = node.files.slice().sort((a,b)=>a.p.localeCompare(b.p));
+  for (const f of fs) {{
+    const base = f.p.split('/').pop();
+    html += `<div class="file" data-name="${{esc(f.p.toLowerCase())}}">`
+      + `<span class="nm">📄 <a href="${{esc(f.v)}}" target="_blank" rel="noopener">${{esc(base)}}</a></span>`
+      + `<span class="sz">${{hb(f.s)}}</span>`
+      + `<a class="ghost mini" style="text-decoration:none;border:1px solid var(--accent);border-radius:6px" href="${{esc(f.d)}}">⬇</a>`
+      + `</div>`;
+  }}
+  return html;
+}}
+document.getElementById('tree').innerHTML = renderDir(root, '');
+// ---- recursive folder download (sequential, staggered) ----
+let toastT;
+function toast(msg) {{
+  const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show');
+  clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'), 2500);
+}}
+async function dl(prefix) {{
+  const sel = prefix==='' ? FILES
+    : FILES.filter(f => f.p===prefix || f.p.startsWith(prefix+'/'));
+  if (!sel.length) {{ toast('No files here.'); return; }}
+  toast('Starting '+sel.length+' download'+(sel.length!=1?'s':'')+'…');
+  for (let i=0;i<sel.length;i++) {{
+    const a=document.createElement('a'); a.href=sel[i].d; a.style.display='none';
+    document.body.appendChild(a); a.click(); a.remove();
+    if (i % 5 === 4) toast('Downloading '+(i+1)+' / '+sel.length+'…');
+    await new Promise(r=>setTimeout(r, 350));   // stagger so the browser keeps up
+  }}
+  toast('All '+sel.length+' download'+(sel.length!=1?'s':'')+' triggered.');
+}}
+// ---- live filter ----
+function filt(q) {{
+  q=q.trim().toLowerCase();
+  document.querySelectorAll('.file').forEach(el=>{{
+    el.style.display = !q || el.dataset.name.includes(q) ? '' : 'none';
+  }});
+  document.querySelectorAll('details').forEach(d=>{{
+    const any=[...d.querySelectorAll('.file')].some(f=>f.style.display!=='none');
+    d.style.display = !q || any ? '' : 'none';
+    if (q && any) d.open = true;
+  }});
+}}
+</script>
+</body></html>"""
+
+    def _open_url(self, url: str) -> None:
+        import webbrowser
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Couldn't open browser:\n{e}")
+
     def _storage_download_selected(self) -> None:
         items = self._storage_selected_items()
         items = [(r, i, t) for (r, i, t) in items if t != "bucket"]
@@ -3533,6 +4529,223 @@ class PawseyApp:
         step(0)
 
 
+    # ------------------------------------------------------------- Console
+    def _build_console_tab(self) -> None:
+        """A built-in command console for running rclone (or any) commands and
+        seeing their output live, without leaving the app."""
+        T = THEME
+        t = self.tab_console
+        t.columnconfigure(0, weight=1)
+        t.rowconfigure(2, weight=1)
+
+        ttk.Label(t, text="Command console", style="Big.TLabel").grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 2))
+        ttk.Label(
+            t,
+            text="Type a command and press Enter (or click Run). With "
+                 "'rclone' prefix ticked you can type just the rclone "
+                 "arguments, e.g.  lsd pawsey:  or  size pawsey:my-bucket. "
+                 "Untick it to run any other command. ↑/↓ recalls history.",
+            style="Muted.TLabel", wraplength=1040, justify="left",
+        ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+
+        # Output area
+        out_frame = ttk.Frame(t)
+        out_frame.grid(row=2, column=0, sticky="nsew", padx=10)
+        out_frame.columnconfigure(0, weight=1)
+        out_frame.rowconfigure(0, weight=1)
+        self.console_output = scrolledtext.ScrolledText(
+            out_frame, height=20, wrap="word", state="disabled",
+            bg="#10242E", fg="#E6F0F3", insertbackground="#E6F0F3",
+            font=("Consolas", 10), relief="flat", borderwidth=0)
+        self.console_output.grid(row=0, column=0, sticky="nsew")
+        self.console_output.tag_configure("cmd", foreground="#7FD0E8",
+                                          font=("Consolas", 10, "bold"))
+        self.console_output.tag_configure("err", foreground="#F2A6A6")
+        self.console_output.tag_configure("ok", foreground="#A6E3A6")
+
+        # Input row
+        inrow = ttk.Frame(t)
+        inrow.grid(row=3, column=0, sticky="ew", padx=10, pady=(8, 4))
+        inrow.columnconfigure(1, weight=1)
+
+        self.console_prefix_rclone = tk.BooleanVar(value=True)
+        ttk.Checkbutton(inrow, text="rclone", variable=self.console_prefix_rclone
+                        ).grid(row=0, column=0, padx=(0, 6))
+        self.console_entry = ttk.Entry(inrow, font=("Consolas", 10))
+        self.console_entry.grid(row=0, column=1, sticky="ew")
+        self.console_entry.bind("<Return>", lambda e: self._console_run())
+        self.console_entry.bind("<Up>", self._console_history_prev)
+        self.console_entry.bind("<Down>", self._console_history_next)
+        self.console_run_btn = ttk.Button(inrow, text="Run",
+                                           style="Accent.TButton",
+                                           command=self._console_run)
+        self.console_run_btn.grid(row=0, column=2, padx=(6, 0))
+        self.console_stop_btn = ttk.Button(inrow, text="Stop", state="disabled",
+                                           command=self._console_stop)
+        self.console_stop_btn.grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(inrow, text="Clear", command=self._console_clear).grid(
+            row=0, column=4, padx=(6, 0))
+
+        # Quick-command shortcuts
+        quick = ttk.Frame(t)
+        quick.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
+        ttk.Label(quick, text="Quick:", style="Muted.TLabel").pack(side="left")
+        for label, cmd in (
+            ("Version", "version"),
+            ("List remotes", "listremotes"),
+            ("List buckets", f"lsd {self.cfg.get('remote_name', 'pawsey')}:"),
+            ("About selected remote", f"about {self.cfg.get('remote_name', 'pawsey')}:"),
+        ):
+            ttk.Button(quick, text=label,
+                       command=lambda c=cmd: self._console_fill(c)
+                       ).pack(side="left", padx=3)
+
+        # Console state
+        self.console_proc: Optional[subprocess.Popen] = None
+        self.console_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._console_history: list[str] = []
+        self._console_hist_idx = 0
+        self.root.after(120, self._console_drain)
+
+    def _console_fill(self, cmd: str) -> None:
+        self.console_prefix_rclone.set(True)
+        self.console_entry.delete(0, "end")
+        self.console_entry.insert(0, cmd)
+        self.console_entry.focus_set()
+
+    def _console_history_prev(self, _e=None):
+        if not self._console_history:
+            return "break"
+        self._console_hist_idx = max(0, self._console_hist_idx - 1)
+        self.console_entry.delete(0, "end")
+        self.console_entry.insert(0, self._console_history[self._console_hist_idx])
+        return "break"
+
+    def _console_history_next(self, _e=None):
+        if not self._console_history:
+            return "break"
+        self._console_hist_idx = min(len(self._console_history),
+                                     self._console_hist_idx + 1)
+        self.console_entry.delete(0, "end")
+        if self._console_hist_idx < len(self._console_history):
+            self.console_entry.insert(0, self._console_history[self._console_hist_idx])
+        return "break"
+
+    # Patterns that delete/destroy data - we double-check before running.
+    _CONSOLE_DESTRUCTIVE = (
+        "delete", "purge", "rmdir", "rmdirs", "deletefile", "cleanup",
+        " rm ", " del ", "format", "config delete",
+    )
+
+    def _console_append(self, text: str, tag: str = "") -> None:
+        self.console_output.configure(state="normal")
+        if tag:
+            self.console_output.insert("end", text, tag)
+        else:
+            self.console_output.insert("end", text)
+        self.console_output.see("end")
+        self.console_output.configure(state="disabled")
+
+    def _console_clear(self) -> None:
+        self.console_output.configure(state="normal")
+        self.console_output.delete("1.0", "end")
+        self.console_output.configure(state="disabled")
+
+    def _console_run(self) -> None:
+        if self.console_proc is not None:
+            messagebox.showinfo(APP_NAME, "A command is already running. Stop it "
+                                          "first or wait for it to finish.")
+            return
+        raw = self.console_entry.get().strip()
+        if not raw:
+            return
+        use_rclone = bool(self.console_prefix_rclone.get())
+
+        # Build the command line.
+        if use_rclone:
+            if not RCLONE_EXE:
+                messagebox.showerror(APP_NAME, "rclone path is not set. Set it on "
+                                               "the Settings tab.")
+                return
+            cmdline = f'"{RCLONE_EXE}" {raw}'
+            display = f"rclone {raw}"
+        else:
+            cmdline = raw
+            display = raw
+
+        # Destructive-command guard.
+        low = f" {raw.lower()} "
+        if any(p in low for p in self._CONSOLE_DESTRUCTIVE):
+            if not messagebox.askyesno(
+                    "Confirm potentially destructive command",
+                    f"This command can permanently delete or destroy data:\n\n"
+                    f"  {display}\n\nRun it anyway?"):
+                return
+
+        # History
+        self._console_history.append(raw)
+        self._console_hist_idx = len(self._console_history)
+
+        self._console_append(f"\n$ {display}\n", "cmd")
+        self.console_entry.delete(0, "end")
+        self.console_run_btn.configure(state="disabled")
+        self.console_stop_btn.configure(state="normal")
+        self.status_var.set(f"Console: running '{display}'…")
+
+        # _subprocess_kwargs() already supplies stdout=PIPE, stderr=STDOUT
+        # (merged), text + bufsize, and the no-window flags. Add stdin + a
+        # forgiving UTF-8 decode so odd bytes never crash the reader.
+        kwargs = _subprocess_kwargs()
+        kwargs.update(stdin=subprocess.DEVNULL, encoding="utf-8",
+                      errors="replace")
+        try:
+            self.console_proc = subprocess.Popen(cmdline, shell=True, **kwargs)
+        except Exception as e:
+            self._console_append(f"Failed to start: {e}\n", "err")
+            self._console_finish(-1)
+            return
+        threading.Thread(target=self._console_reader,
+                         args=(self.console_proc,), daemon=True).start()
+
+    def _console_reader(self, proc: subprocess.Popen) -> None:
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                self.console_queue.put(("line", line))
+            proc.stdout.close()
+        except Exception:
+            pass
+        rc = proc.wait()
+        self.console_queue.put(("done", str(rc)))
+
+    def _console_drain(self) -> None:
+        try:
+            while True:
+                kind, payload = self.console_queue.get_nowait()
+                if kind == "line":
+                    self._console_append(payload)
+                elif kind == "done":
+                    self._console_finish(int(payload))
+        except queue.Empty:
+            pass
+        self.root.after(120, self._console_drain)
+
+    def _console_finish(self, rc: int) -> None:
+        if rc == 0:
+            self._console_append("✓ done (exit 0)\n", "ok")
+            self.status_var.set("Console: command finished.")
+        else:
+            self._console_append(f"✗ exit code {rc}\n", "err")
+            self.status_var.set(f"Console: command exited with code {rc}.")
+        self.console_proc = None
+        self.console_run_btn.configure(state="normal")
+        self.console_stop_btn.configure(state="disabled")
+
+    def _console_stop(self) -> None:
+        if self.console_proc is not None:
+            stop_process(self.console_proc)
+            self._console_append("\n[stopped by user]\n", "err")
+
     # ------------------------------------------------------------- History
     def _build_history_tab(self) -> None:
         t = self.tab_history
@@ -3614,6 +4827,201 @@ class PawseyApp:
             messagebox.showerror(APP_NAME, f"Could not open folder:\n{e}")
 
     # ------------------------------------------------------------- Settings
+    # ===== Multi-project (multiple Pawsey remotes) =======================
+
+    def _migrate_projects(self) -> None:
+        """Ensure the projects dict exists. Seed it from the legacy single-
+        remote config the first time so existing users keep their setup."""
+        projects = self.cfg.get("projects") or {}
+        if not projects:
+            name = (self.cfg.get("remote_name") or "").strip()
+            access = self.cfg.get("access_key_id") or ""
+            secret = self.cfg.get("secret_access_key") or ""
+            if name and access and secret:
+                projects = {name: {
+                    "endpoint": self.cfg.get("endpoint", ""),
+                    "access_key_id": access,
+                    "secret_access_key": secret,
+                    "provider": self.cfg.get("provider", "Ceph"),
+                    "label": name,
+                }}
+                self.cfg.set("projects", projects)
+                self.cfg.set("active_project", name)
+                self.cfg.save()
+        if not self.cfg.get("active_project") and projects:
+            # Pick the current remote_name if present, else the first project.
+            rn = self.cfg.get("remote_name")
+            self.cfg.set("active_project",
+                         rn if rn in projects else next(iter(projects)))
+            self.cfg.save()
+
+    def _projects(self) -> dict:
+        return dict(self.cfg.get("projects") or {})
+
+    def _project_names(self) -> list:
+        return sorted(self._projects().keys())
+
+    def _set_active_project(self, name: str, *, announce: bool = True) -> None:
+        """Make `name` the app-wide default project and push its creds into the
+        top-level config keys the rest of the app reads."""
+        projects = self._projects()
+        if name not in projects:
+            return
+        p = projects[name]
+        self.cfg.set("active_project", name)
+        self.cfg.set("remote_name", name)
+        self.cfg.set("endpoint", p.get("endpoint", ""))
+        self.cfg.set("access_key_id", p.get("access_key_id", ""))
+        self.cfg.set("secret_access_key", p.get("secret_access_key", ""))
+        self.cfg.set("provider", p.get("provider", "Ceph"))
+        self.cfg.save()
+        # Repoint the remote selectors on the other tabs.
+        for var_name in ("remote_var", "buckets_remote", "storage_remote"):
+            var = getattr(self, var_name, None)
+            if var is not None:
+                try:
+                    var.set(name)
+                except Exception:
+                    pass
+        if hasattr(self, "_refresh_remotes"):
+            self._refresh_remotes()
+        if hasattr(self, "_refresh_buckets"):
+            try:
+                self._refresh_buckets()
+            except Exception:
+                pass
+        self.status_var.set(f"Active project: {name}")
+        if announce:
+            messagebox.showinfo(
+                APP_NAME, f"'{name}' is now the active project.\n\n"
+                          "The Transfer, Buckets and Storage tabs now default "
+                          "to it. You can still pick any project from the "
+                          "Remote dropdown on those tabs.")
+
+    def _refresh_projects_ui(self) -> None:
+        names = self._project_names()
+        active = self.cfg.get("active_project", "")
+        values = [f"★ {n}" if n == active else f"   {n}" for n in names]
+        self.proj_combo["values"] = values
+        # Keep the current selection if possible, else select the active one.
+        cur = self._selected_project_name()
+        target = cur if cur in names else (active if active in names else
+                                           (names[0] if names else ""))
+        if target:
+            idx = names.index(target)
+            self.proj_combo.current(idx)
+            self._load_project_into_fields(target)
+        else:
+            self.proj_combo.set("")
+            self._clear_project_fields()
+        self.proj_active_label.configure(
+            text=f"Active project: {active or '(none)'}")
+
+    def _selected_project_name(self) -> str:
+        val = self.proj_combo.get().strip()
+        return val.lstrip("★ ").strip()
+
+    def _clear_project_fields(self) -> None:
+        for var in (self.s_name, self.s_endpoint, self.s_access, self.s_secret):
+            var.set("")
+        self.s_provider.set("Ceph")
+        if not self.s_endpoint.get():
+            self.s_endpoint.set("https://projects.pawsey.org.au")
+
+    def _load_project_into_fields(self, name: str) -> None:
+        p = self._projects().get(name, {})
+        self.s_name.set(name)
+        self.s_endpoint.set(p.get("endpoint", "https://projects.pawsey.org.au"))
+        self.s_provider.set(p.get("provider", "Ceph"))
+        self.s_access.set(p.get("access_key_id", ""))
+        self.s_secret.set(p.get("secret_access_key", ""))
+
+    def _on_project_selected(self, _e=None) -> None:
+        name = self._selected_project_name()
+        if name:
+            self._load_project_into_fields(name)
+
+    def _project_new(self) -> None:
+        self.proj_combo.set("")
+        self._clear_project_fields()
+        self.s_name.set("")
+        self.status_var.set("Enter the new project's details, then 'Save project'.")
+
+    def _project_save(self) -> None:
+        name = self.s_name.get().strip()
+        endpoint = self.s_endpoint.get().strip()
+        access = self.s_access.get().strip()
+        secret = self.s_secret.get().strip()
+        provider = self.s_provider.get().strip() or "Ceph"
+        # Write the rclone remote first; if that fails, don't save a half-config.
+        ok, msg = RcloneRemote.upsert_remote(name, endpoint, access, secret, provider)
+        if not ok:
+            messagebox.showerror(APP_NAME, msg)
+            return
+        projects = self._projects()
+        first = not projects
+        projects[name] = {
+            "endpoint": endpoint, "access_key_id": access,
+            "secret_access_key": secret, "provider": provider, "label": name,
+        }
+        self.cfg.set("projects", projects)
+        self.cfg.save()
+        # The very first project (or saving the active one) becomes active.
+        if first or name == self.cfg.get("active_project"):
+            self._set_active_project(name, announce=False)
+        self._refresh_projects_ui()
+        self._refresh_remotes()
+        messagebox.showinfo(APP_NAME, msg)
+
+    def _project_set_active(self) -> None:
+        name = self._selected_project_name()
+        if not name or name not in self._projects():
+            messagebox.showerror(APP_NAME, "Pick a saved project first.")
+            return
+        self._set_active_project(name)
+        self._refresh_projects_ui()
+
+    def _project_test(self) -> None:
+        name = self._selected_project_name() or self.s_name.get().strip()
+        if not name:
+            messagebox.showerror(APP_NAME, "Pick or name a project first.")
+            return
+        self.status_var.set(f"Testing connection to {name}…")
+        ok, out = RcloneRemote.test_remote(name)
+        if ok:
+            messagebox.showinfo(
+                APP_NAME, f"Connection to '{name}' OK.\n\nBuckets:\n{out or '(none)'}")
+            self.status_var.set(f"{name}: connection OK.")
+        else:
+            messagebox.showerror(APP_NAME, f"Connection to '{name}' failed:\n{out}")
+            self.status_var.set(f"{name}: connection failed.")
+
+    def _project_remove(self) -> None:
+        name = self._selected_project_name()
+        projects = self._projects()
+        if not name or name not in projects:
+            messagebox.showerror(APP_NAME, "Pick a saved project to remove.")
+            return
+        if not messagebox.askyesno(
+                APP_NAME,
+                f"Remove project '{name}' from the app and from rclone?\n\n"
+                "This only forgets the connection/credentials — it does NOT "
+                "delete any data on Pawsey."):
+            return
+        RcloneRemote.delete_remote(name)
+        projects.pop(name, None)
+        self.cfg.set("projects", projects)
+        # If we removed the active one, fall back to another project.
+        if self.cfg.get("active_project") == name:
+            if projects:
+                self._set_active_project(next(iter(projects)), announce=False)
+            else:
+                self.cfg.set("active_project", "")
+        self.cfg.save()
+        self._refresh_projects_ui()
+        self._refresh_remotes()
+        self.status_var.set(f"Removed project '{name}'.")
+
     def _build_settings_tab(self) -> None:
         t = self.tab_settings
         for i in range(2):
@@ -3640,36 +5048,65 @@ class PawseyApp:
         self.s_rclone_status.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
         self._update_rclone_status_label()
 
-        # Remote section
-        rs = ttk.LabelFrame(t, text="Pawsey remote (rclone)")
+        # Pawsey projects section (multi-project)
+        rs = ttk.LabelFrame(t, text="Pawsey projects  (each project = one rclone remote)")
         rs.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=6)
-        for i in range(2):
-            rs.columnconfigure(i, weight=1)
+        rs.columnconfigure(1, weight=1)
 
         self.s_name = tk.StringVar(value=self.cfg.get("remote_name"))
         self.s_endpoint = tk.StringVar(value=self.cfg.get("endpoint"))
         self.s_access = tk.StringVar(value=self.cfg.get("access_key_id"))
         self.s_secret = tk.StringVar(value=self.cfg.get("secret_access_key"))
-        self.s_provider = tk.StringVar(value=self.cfg.get("provider"))
+        self.s_provider = tk.StringVar(value=self.cfg.get("provider") or "Ceph")
 
-        rows = [
-            ("Remote name", self.s_name, False),
+        # Top row: project picker + active indicator
+        picker = ttk.Frame(rs)
+        picker.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 2))
+        picker.columnconfigure(1, weight=1)
+        ttk.Label(picker, text="Saved project:").grid(row=0, column=0, sticky="w")
+        self.proj_combo = ttk.Combobox(picker, state="readonly", width=28)
+        self.proj_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        self.proj_combo.bind("<<ComboboxSelected>>", self._on_project_selected)
+        self.proj_active_label = ttk.Label(picker, text="", style="Muted.TLabel")
+        self.proj_active_label.grid(row=0, column=2, sticky="e")
+
+        ttk.Separator(rs, orient="horizontal").grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=4)
+
+        # Editable fields for the selected/new project
+        fields = [
+            ("Project name (remote)", self.s_name, False),
             ("Endpoint URL", self.s_endpoint, False),
             ("Provider", self.s_provider, False),
             ("Access key ID", self.s_access, False),
             ("Secret access key", self.s_secret, True),
         ]
-        for r, (label, var, secret) in enumerate(rows):
+        for i, (label, var, secret) in enumerate(fields):
+            r = i + 2
             ttk.Label(rs, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=4)
-            entry = ttk.Entry(rs, textvariable=var, show="•" if secret else "")
-            entry.grid(row=r, column=1, sticky="ew", padx=8, pady=4)
+            ttk.Entry(rs, textvariable=var, show="•" if secret else "").grid(
+                row=r, column=1, sticky="ew", padx=8, pady=4)
+
+        ttk.Label(rs, text="Tip: to add another project's storage you need its "
+                          "access key, secret and bucket — see the Help tab. "
+                          "'Set as active' makes a project the default across "
+                          "all tabs.",
+                  style="Muted.TLabel", wraplength=720, justify="left").grid(
+            row=len(fields) + 2, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 4))
 
         btns = ttk.Frame(rs)
-        btns.grid(row=len(rows), column=0, columnspan=2, sticky="e", padx=8, pady=8)
-        ttk.Button(btns, text="Save & apply to rclone",
-                   command=self._save_remote).pack(side="left", padx=4)
+        btns.grid(row=len(fields) + 3, column=0, columnspan=2, sticky="ew",
+                  padx=8, pady=8)
+        ttk.Button(btns, text="New project",
+                   command=self._project_new).pack(side="left", padx=2)
+        ttk.Button(btns, text="Save project", style="Accent.TButton",
+                   command=self._project_save).pack(side="left", padx=2)
+        ttk.Button(btns, text="Set as active",
+                   command=self._project_set_active).pack(side="left", padx=2)
         ttk.Button(btns, text="Test connection",
-                   command=self._test_remote).pack(side="left", padx=4)
+                   command=self._project_test).pack(side="left", padx=2)
+        ttk.Button(btns, text="Remove", style="Danger.TButton",
+                   command=self._project_remove).pack(side="right", padx=2)
 
         # Defaults section
         ds = ttk.LabelFrame(t, text="Defaults")
@@ -3724,6 +5161,9 @@ class PawseyApp:
         ttk.Button(t, text="Save defaults",
                    command=self._save_defaults).grid(row=4, column=1, sticky="e",
                                                     padx=10, pady=(0, 10))
+
+        # Populate the project picker now that all widgets exist.
+        self._refresh_projects_ui()
 
     # -------- rclone path helpers (used by the Settings tab) --------
     def _update_rclone_status_label(self) -> None:
@@ -3782,34 +5222,6 @@ class PawseyApp:
         d = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
         if d:
             var.set(d)
-
-    def _save_remote(self) -> None:
-        # Copy widget state into config and persist
-        self.cfg.set("remote_name", self.s_name.get().strip())
-        self.cfg.set("endpoint", self.s_endpoint.get().strip())
-        self.cfg.set("provider", self.s_provider.get().strip())
-        self.cfg.set("access_key_id", self.s_access.get().strip())
-        self.cfg.set("secret_access_key", self.s_secret.get().strip())
-        self.cfg.save()
-
-        ok, msg = RcloneRemote.upsert_pawsey_remote(self.cfg)
-        if ok:
-            messagebox.showinfo(APP_NAME, msg)
-        else:
-            messagebox.showerror(APP_NAME, msg)
-        self._refresh_remotes()
-
-    def _test_remote(self) -> None:
-        name = self.s_name.get().strip()
-        if not name:
-            messagebox.showerror(APP_NAME, "Set a remote name first.")
-            return
-        ok, out = RcloneRemote.test_remote(name)
-        if ok:
-            messagebox.showinfo(APP_NAME,
-                                f"Connection OK.\n\nBuckets:\n{out or '(none)'}")
-        else:
-            messagebox.showerror(APP_NAME, f"Connection failed:\n{out}")
 
     def _save_defaults(self) -> None:
         self.cfg.set("default_project", self.s_project.get().strip())
@@ -3899,6 +5311,70 @@ Getting started
          bidirectional sync via `rclone bisync`.
        * Resume previous transfer - pick any incomplete past transfer.
    - Click 'Start transfer'.
+   - PREVIEW FIRST (optional): tick "Preview only (dry-run)" in Sync
+     options to have rclone report exactly what it WOULD copy, change or
+     delete without transferring or removing anything. Great for checking
+     a Mirror or two-way sync before you commit. (With the box unticked,
+     every transfer is a real live run - the app never silently previews.)
+
+Multiple Pawsey projects (Settings tab)
+---------------------------------------
+  Each Pawsey project is a separate set of Acacia keys, managed here as a
+  separate "project" (rclone remote). Most of the time you work in ONE active
+  project, but you can save several and switch between them.
+    - NEW PROJECT: click 'New project', fill in a project name (letters,
+      numbers, - and _; no spaces), the endpoint
+      (https://projects.pawsey.org.au), provider (Ceph), and the access
+      key + secret, then 'Save project'.
+    - SET AS ACTIVE: pick a saved project and click 'Set as active' (the
+      active one is marked with a ★). All tabs then default to it; you can
+      still pick any project from the Remote dropdown on each tab.
+    - TEST / REMOVE: 'Test connection' lists its buckets; 'Remove' forgets
+      the project and its keys (it never deletes data on Pawsey).
+
+  COPYING BETWEEN PROJECTS: once two projects are saved, copy across them on
+  the Storage tab — Copy/Cut in one project, switch the Remote dropdown to the
+  other, then Paste — or use the Console: `copy projectA:bucket projectB:bucket`.
+  If the two projects use different keys the data streams through your machine
+  (not server-side), so run big migrations on a Pawsey/Nimbus VM.
+
+  ACCESS TO SOMEONE ELSE'S PROJECT: you need an access key + secret that has
+  permission on their bucket(s). Best options: ask their project owner to add
+  you to the project (you make your own keys), or to grant your existing key
+  read access to specific buckets via a bucket policy (this also enables fast
+  server-side copies). Sharing raw keys works but is least secure.
+
+New in v1.5
+-----------
+  ORGANISE ON PAWSEY (Storage tab) - works just like Windows Explorer:
+    - Select a file/folder, click COPY or CUT, then select the destination
+      bucket/folder and click PASTE HERE. Within the same remote this is a
+      server-side copy/move on Pawsey - no download or re-upload. A note is
+      required for the paste. A copy stays on the clipboard (paste again
+      elsewhere); a cut is cleared once pasted.
+
+  SHARE A LINK (Storage tab -> "Generate link..."):
+    - Select a file, folder or bucket and choose how long the link should
+      work (minutes / hours / days; S3's maximum is 7 days). Every link
+      works from ANY browser, anywhere - the recipient needs no Pawsey
+      account.
+    - A FILE gives one shareable link (copied to your clipboard).
+    - A FOLDER or BUCKET builds a small file-browser web page (expand
+      folders, view/download any file, or download a whole folder at once),
+      uploads that page into the bucket under "_shares/", and gives you ONE
+      link to the page. Send that single link to your end-users.
+    - These are S3 "presigned URLs" built from your stored keys - rclone's
+      own `link` command does not support expiring links on Pawsey's S3.
+      Anyone with a link can access that data until it expires. Folder
+      downloads save files individually (the folder path is kept in each
+      file's name). Tidy up old share pages from "_shares/" any time.
+
+  COMMAND CONSOLE (Console tab):
+    - Run any rclone command (tick 'rclone' and type just the arguments,
+      e.g.  lsd pawsey:  ) or untick it to run any other command. Output
+      streams live; use Stop to cancel. Up/Down arrows recall history, and
+      the Quick buttons fill in common commands. Commands that can delete
+      data ask for confirmation first.
 
 Sync options (apply to the modes above)
 ---------------------------------------
@@ -4175,6 +5651,12 @@ Built for Pawsey Acacia uploads. Free to adapt.
             # Mark resume entry as stopped so it shows up in the picker
             if self.current_resume_id:
                 ResumeStore.update(self.current_resume_id, status="stopped")
+        # Stop any console command still running.
+        if getattr(self, "console_proc", None) is not None:
+            try:
+                stop_process(self.console_proc)
+            except Exception:
+                pass
         # Always release sleep lock and finalise heartbeat on exit
         self._cancel_autosync()
         prevent_sleep(False)
