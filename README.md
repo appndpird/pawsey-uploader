@@ -165,6 +165,7 @@ build_exe.bat               # one-click Windows build script
 build_linux.sh              # one-click Linux build script
 PawseyUploader.spec         # PyInstaller build spec
 dist/PawseyUploader.exe     # prebuilt Windows executable — always the LATEST version
+dist/PawseyUploader-v1.8.exe # retained previous version
 dist/PawseyUploader-v1.7.exe # retained previous version
 dist/PawseyUploader-v1.6.exe # retained previous version
 dist/PawseyUploader-v1.4.exe # retained older version
@@ -179,7 +180,8 @@ the running app shows its version in the title bar and on the Help tab.
 
 | File | Version | Notes |
 |---|---|---|
-| `dist/PawseyUploader.exe` | **v1.8 (latest)** | "Send to another project" (copy data to another Pawsey project's bucket) |
+| `dist/PawseyUploader.exe` | **v1.9 (latest)** | Background (survives app close) + resumable "Send to another project" |
+| `dist/PawseyUploader-v1.8.exe` | v1.8 | "Send to another project" (copy data to another Pawsey project's bucket) |
 | `dist/PawseyUploader-v1.7.exe` | v1.7 | DPIRD-primary header (larger DPIRD logo left, APPN top-right) |
 | `dist/PawseyUploader-v1.6.exe` | v1.6 | Multi-project management, presigned share pages |
 | `dist/PawseyUploader-v1.4.exe` | v1.4 | Two-way sync, recycle bin, unattended operation |
@@ -203,6 +205,17 @@ having more than one lets you **copy data from one project to another**:
   the cloud on Acacia rather than downloading it. (A collaborator who only needs
   to *download* the data, or has no Pawsey account, is better served by a
   shareable link — see below.)
+  * **Keep running after I close the app** (ticked by default) runs the copy as
+    a **background job**: it survives closing the app or the app crashing, logs
+    to a file, and can be **resumed**. It still stops if the computer sleeps or
+    shuts down — for genuinely long, unattended transfers run rclone on a
+    Pawsey/Nimbus VM. Untick it to run in-app with a live result instead (which
+    stops if you close the app).
+  * **Resuming** — every cross-project copy is remembered. If one is interrupted
+    (close, crash, or restart), reopen the app and use **"Background copies…"**
+    (next to the Send button) to **Resume** it. Resuming re-runs `rclone copy`,
+    which skips files already present at the destination, so it continues rather
+    than starting over — no duplicates, nothing deleted.
 * Or, the manual route — Copy/Cut in one project, switch the Remote dropdown to
   the other, then Paste.
 * Or on the **Console** — `copy projectA:bucket projectB:bucket -P`.

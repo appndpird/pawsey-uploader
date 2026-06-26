@@ -30,6 +30,7 @@ import os
 import platform
 import queue
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -55,7 +56,7 @@ except Exception:  # pragma: no cover - logos are cosmetic
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Pawsey Uploader"
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 APP_TAGLINE = "DPIRD · APPN  |  Pawsey Acacia object storage manager"
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,7 @@ RESUME_FILE = APP_DIR / "resume.json"                  # new: multi-slot resume
 HEARTBEAT_FILE = APP_DIR / "heartbeat.json"            # liveness for external tools
 TRANSFER_LOG_DIR = APP_DIR / "logs"                    # per-transfer verbose logs
 BISYNC_STATE_FILE = APP_DIR / "bisync_pairs.json"      # which pairs are initialised
+SEND_JOBS_DIR = APP_DIR / "send_jobs"                  # detached project->project copy jobs
 
 # Soft-delete recycle bin. When enabled, files that a sync would delete or
 # overwrite, and items deleted from the Storage tab, are moved into this
@@ -214,6 +216,23 @@ def stop_process(proc: Optional[subprocess.Popen]) -> None:
             proc.kill()
         except Exception:
             pass
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    """Best-effort check whether a process id is still running."""
+    if not pid:
+        return False
+    try:
+        if IS_WINDOWS:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {int(pid)}", "/NH"],
+                capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            return str(int(pid)) in (out.stdout or "")
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
 
 
 def run_rclone_capture(args: list[str], timeout: int = 60) -> tuple[int, str]:
@@ -607,8 +626,11 @@ class ResumeStore:
 
     @staticmethod
     def list_incomplete() -> list[dict]:
+        # Project->project copies are managed by the Storage "Background
+        # copies…" manager, not the Transfer-tab resume picker.
         return [t for t in ResumeStore.list_all()
-                if t.get("status") not in ("completed",)]
+                if t.get("status") not in ("completed",)
+                and t.get("kind") != "project_copy"]
 
     @staticmethod
     def add(entry: dict) -> str:
@@ -637,6 +659,15 @@ class ResumeStore:
             if t.get("id") == entry_id:
                 return t
         return None
+
+    @staticmethod
+    def remove(entry_id: str) -> None:
+        if not entry_id:
+            return
+        data = ResumeStore._load_raw()
+        data["transfers"] = [t for t in data.get("transfers", [])
+                             if t.get("id") != entry_id]
+        ResumeStore._save_raw(data)
 
     @staticmethod
     def migrate_legacy() -> None:
@@ -717,6 +748,8 @@ class PawseyApp:
         self.proc_queue: queue.Queue[str] = queue.Queue()
         self.proc_thread: Optional[threading.Thread] = None
         self.transfer_active = False
+        # Count of foreground (in-app) project->project copies in flight
+        self._send_fg_active = 0
         # Background-call result queue (UI updates after rclone tasks)
         self._bg_queue: queue.Queue = queue.Queue()
 
@@ -747,6 +780,7 @@ class PawseyApp:
         # Migrate any legacy last_transfer.json into the new resume store
         ResumeStore.migrate_legacy()
         TRANSFER_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        SEND_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
         # Resolve rclone executable BEFORE any rclone calls happen.
         # This also writes the discovered path back into the config so
@@ -766,6 +800,8 @@ class PawseyApp:
         root.after(100, self._drain_output)
         # Periodically drain background-task results (Storage tab, etc.)
         root.after(120, self._drain_bg_queue)
+        # Reconcile detached project->project copy jobs once the UI is up
+        root.after(500, self._reconcile_project_copies)
 
     # ----------------------------------------------------- rclone discovery
     def _resolve_rclone_executable(self, prompt_if_missing: bool = True) -> bool:
@@ -2725,6 +2761,8 @@ class PawseyApp:
         self.storage_paste_btn.pack(side="left", padx=2)
         ttk.Button(btns, text="📤 Send to another project…",
                    command=self._storage_send_to_project).pack(side="left", padx=2)
+        ttk.Button(btns, text="Background copies…",
+                   command=self._project_copies_manager).pack(side="left", padx=2)
         ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(btns, text="🔗 Generate link…",
                    command=self._storage_generate_link).pack(side="left", padx=2)
@@ -3924,7 +3962,21 @@ class PawseyApp:
                 "a laptop.")
         ttk.Label(frm, text=warn, foreground="#9A5B00",
                   wraplength=440).grid(row=6, column=0, columnspan=2,
-                                       sticky="w", pady=(0, 10))
+                                       sticky="w", pady=(0, 8))
+
+        bg_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frm, variable=bg_var,
+            text="Keep running after I close the app (background job)").grid(
+                row=7, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            frm, style="Muted.TLabel", wraplength=440,
+            text="Background: the copy survives closing the app or it crashing, "
+                 "logs to a file, and can be resumed from “Background copies…”. "
+                 "It still stops if the computer sleeps or shuts down. Unticked: "
+                 "runs in-app with a live result, but stops if you close the "
+                 "app.").grid(row=8, column=0, columnspan=2, sticky="w",
+                              pady=(0, 10))
 
         def load_buckets(*_):
             r = proj_var.get().strip()
@@ -3979,19 +4031,24 @@ class PawseyApp:
                     APP_NAME, "Enter or pick a destination bucket.", parent=dlg)
                 return
             dest_root = f"{dest_bucket}/{subfolder}" if subfolder else dest_bucket
+            background = bool(bg_var.get())
+            mode_line = ("It will keep running even if you close the app."
+                         if background else
+                         "It runs in-app and stops if you close the app.")
             if not messagebox.askyesno(
                     "Confirm copy to another project",
                     f"Copy {len(items)} item(s) from project “{src_remote}” to:\n\n"
                     f"  {dest_remote}:{dest_root}/\n\n"
                     f"Copy only — nothing on “{dest_remote}” is deleted.\n"
-                    f"Continue?", parent=dlg):
+                    f"{mode_line}\n\nContinue?", parent=dlg):
                 return
             dlg.destroy()
-            self._run_send_to_project(items, src_remote, dest_remote,
-                                      dest_root, notes)
+            pairs = [(i, t) for (_r, i, t) in items]
+            self._start_send_job(pairs, src_remote, dest_remote, dest_bucket,
+                                 subfolder, notes, background)
 
         btnrow = ttk.Frame(frm)
-        btnrow.grid(row=7, column=0, columnspan=2, sticky="e", pady=(4, 0))
+        btnrow.grid(row=9, column=0, columnspan=2, sticky="e", pady=(4, 0))
         ttk.Button(btnrow, text="Cancel",
                    command=dlg.destroy).pack(side="right", padx=2)
         ttk.Button(btnrow, text="Copy to project", style="Accent.TButton",
@@ -4006,43 +4063,91 @@ class PawseyApp:
         dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         dlg.grab_set()
 
-    def _run_send_to_project(self, items, src_remote, dest_remote,
-                             dest_root, notes) -> None:
-        """Run the cross-project copy in the background (copy-only)."""
-        self.status_var.set(
-            f"Copying {len(items)} item(s) to {dest_remote}:{dest_root}/ …")
+    def _send_build_commands(self, items, src_remote, dest_remote, dest_root):
+        """Return one rclone arg-list per item (copy-only, type-aware)."""
+        cmds = []
+        for it in items:
+            iid, type_ = it[0], it[1]
+            base = iid.split("/")[-1]
+            src_full = f"{src_remote}:{iid}"
+            dest_full = f"{dest_remote}:{dest_root}/{base}"
+            if type_ == "file":
+                cmds.append(["copyto", src_full, dest_full,
+                             "--s3-no-check-bucket"])
+            else:  # folder or whole bucket
+                cmds.append(["copy", src_full, dest_full,
+                             "--create-empty-src-dirs", "--s3-directory-markers",
+                             "--s3-no-check-bucket"])
+        return cmds
+
+    def _start_send_job(self, pairs, src_remote, dest_remote, dest_bucket,
+                        subfolder, notes, background) -> None:
+        """Register a resumable project->project copy job, then run it either
+        in-app (foreground) or as a detached background process."""
+        dest_root = f"{dest_bucket}/{subfolder}" if subfolder else dest_bucket
+        jid = "pc_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        ext = "cmd" if IS_WINDOWS else "sh"
+        entry = {
+            "id": jid,
+            "kind": "project_copy",
+            "status": "running",
+            "src_remote": src_remote,
+            "items": [[i, t] for (i, t) in pairs],
+            "dest_remote": dest_remote,
+            "dest_bucket": dest_bucket,
+            "dest_subfolder": subfolder,
+            "dest_root": dest_root,
+            "notes": notes,
+            "background": bool(background),
+            "started": datetime.now().isoformat(timespec="seconds"),
+            "pid": None,
+            "log_file": str(SEND_JOBS_DIR / f"{jid}.log"),
+            "status_file": str(SEND_JOBS_DIR / f"{jid}.status"),
+            "script_file": str(SEND_JOBS_DIR / f"{jid}.{ext}"),
+        }
+        ResumeStore.add(entry)
         self._append_log({
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "operation": "send_to_project",
-            "source": f"{src_remote}: {[i for _r, i, _t in items]}",
+            "source": f"{src_remote}: {[i for i, _t in pairs]}",
             "destination": f"{dest_remote}:{dest_root}",
             "notes": notes,
+            "mode": "background" if background else "foreground",
             "status": "started",
         })
+        if background:
+            self._launch_send_detached(entry)
+        else:
+            self._run_send_foreground(entry)
+
+    def _run_send_foreground(self, entry) -> None:
+        """Run the cross-project copy in-app (stops if the app closes; the job
+        is still recorded so it can be resumed afterwards)."""
+        cmds = self._send_build_commands(
+            entry["items"], entry["src_remote"], entry["dest_remote"],
+            entry["dest_root"])
+        dest_remote, dest_root = entry["dest_remote"], entry["dest_root"]
+        self._send_fg_active += 1
+        self.status_var.set(
+            f"Copying {len(cmds)} item(s) to {dest_remote}:{dest_root}/ …")
 
         def work():
             results = []
-            for _r, iid, type_ in items:
-                base = iid.split("/")[-1]
-                src_full = f"{src_remote}:{iid}"
-                dest_full = f"{dest_remote}:{dest_root}/{base}"
-                if type_ == "file":
-                    args = ["copyto", src_full, dest_full,
-                            "--s3-no-check-bucket"]
-                else:  # folder or whole bucket
-                    args = ["copy", src_full, dest_full,
-                            "--create-empty-src-dirs", "--s3-directory-markers",
-                            "--s3-no-check-bucket"]
+            for it, args in zip(entry["items"], cmds):
                 rc, out = run_rclone_capture(args, timeout=86400)
-                results.append((iid, rc, out))
+                results.append((it[0], rc, out))
             return results
 
         def done(results, err):
+            self._send_fg_active = max(0, self._send_fg_active - 1)
             if err:
+                ResumeStore.update(entry["id"], status="failed")
                 messagebox.showerror(APP_NAME, f"Copy error:\n{err}")
                 self.status_var.set("Copy to project failed.")
                 return
             failed = [(iid, out) for (iid, rc, out) in results if rc != 0]
+            ResumeStore.update(
+                entry["id"], status="completed" if not failed else "failed")
             self._append_log({
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "operation": "send_to_project",
@@ -4059,7 +4164,8 @@ class PawseyApp:
                 messagebox.showwarning(
                     APP_NAME,
                     f"{ok} of {len(results)} copied to {dest_remote}; "
-                    f"{len(failed)} failed:\n\n{msg}")
+                    f"{len(failed)} failed:\n\n{msg}\n\n"
+                    f"Resume it later from “Background copies…”.")
                 self.status_var.set(
                     f"Copy to project finished with {len(failed)} error(s).")
             else:
@@ -4073,6 +4179,272 @@ class PawseyApp:
                     f"to see them.")
 
         self._bg_call(work, done)
+
+    # ----- Detached (survives app close) + resume -------------------------
+
+    def _write_send_script(self, entry, cmds) -> str:
+        """Write a launcher script that runs the rclone copies sequentially,
+        logs to a file, and writes a final status sentinel. Returns its path."""
+        log, status = entry["log_file"], entry["status_file"]
+        prog = ["--stats", "30s", "--stats-one-line", "-v"]
+        path = entry["script_file"]
+        if IS_WINDOWS:
+            def q(s):
+                return '"' + str(s) + '"'
+            lines = ["@echo off", 'set "FAILED="',
+                     f'> {q(log)} echo === project-copy {entry["id"]} ===']
+            for args in cmds:
+                toks = [RCLONE_EXE] + args + prog
+                lines.append(" ".join(q(t) for t in toks) + f" >> {q(log)} 2>&1")
+                lines.append('if errorlevel 1 set "FAILED=1"')
+            lines.append(f'if defined FAILED (> {q(status)} echo failed) '
+                         f'else (> {q(status)} echo completed)')
+            text = "\r\n".join(lines) + "\r\n"
+        else:
+            def q(s):
+                return shlex.quote(str(s))
+            lines = ["#!/bin/sh", "FAILED=0",
+                     f'echo "=== project-copy {entry["id"]} ===" > {q(log)}']
+            for args in cmds:
+                toks = [RCLONE_EXE] + args + prog
+                lines.append(" ".join(q(t) for t in toks)
+                             + f" >> {q(log)} 2>&1 || FAILED=1")
+            lines.append(f'if [ "$FAILED" -ne 0 ]; then echo failed > {q(status)}; '
+                         f'else echo completed > {q(status)}; fi')
+            text = "\n".join(lines) + "\n"
+        Path(path).write_text(text, encoding="utf-8")
+        if not IS_WINDOWS:
+            try:
+                os.chmod(path, 0o755)
+            except Exception:
+                pass
+        return path
+
+    def _spawn_detached(self, script_path) -> int:
+        """Launch the launcher script so it outlives this app. Returns the
+        child process id.
+
+        NOTE: we use CREATE_NO_WINDOW, NOT DETACHED_PROCESS. DETACHED_PROCESS
+        breaks the in-script output redirection to the log for the rclone
+        grandchild. It isn't needed for survival anyway: Windows does not kill
+        child processes when the parent exits (Python never puts them in a
+        kill-on-close job), so a plain background child keeps running after the
+        app closes."""
+        if IS_WINDOWS:
+            flags = (subprocess.CREATE_NO_WINDOW
+                     | subprocess.CREATE_NEW_PROCESS_GROUP)
+            p = subprocess.Popen(
+                ["cmd", "/c", script_path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, creationflags=flags,
+                close_fds=True, cwd=str(APP_DIR))
+        else:
+            p = subprocess.Popen(
+                ["/bin/sh", script_path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+                close_fds=True, cwd=str(APP_DIR))
+        return p.pid
+
+    def _launch_send_detached(self, entry) -> None:
+        cmds = self._send_build_commands(
+            entry["items"], entry["src_remote"], entry["dest_remote"],
+            entry["dest_root"])
+        try:
+            Path(entry["status_file"]).unlink()
+        except Exception:
+            pass
+        try:
+            self._write_send_script(entry, cmds)
+            pid = self._spawn_detached(entry["script_file"])
+        except Exception as e:
+            ResumeStore.update(entry["id"], status="failed")
+            messagebox.showerror(
+                APP_NAME, f"Could not start background copy:\n{e}")
+            self.status_var.set("Background copy failed to start.")
+            return
+        ResumeStore.update(entry["id"], pid=pid, status="running")
+        entry["pid"] = pid
+        try:
+            self.storage_notes.delete("1.0", "end")
+        except Exception:
+            pass
+        self.status_var.set(
+            f"Background copy started → {entry['dest_remote']}:"
+            f"{entry['dest_root']}/  (keeps running if you close the app).")
+        messagebox.showinfo(
+            APP_NAME,
+            f"Background copy started.\n\nCopying to:\n  "
+            f"{entry['dest_remote']}:{entry['dest_root']}/\n\n"
+            f"You can close the app — the copy keeps running. Reopen the app "
+            f"and use Storage → “Background copies…” to check status or resume "
+            f"it.\n\nLog file:\n{entry['log_file']}")
+        self._poll_send_job(entry["id"])
+
+    def _read_send_status(self, entry):
+        try:
+            txt = Path(entry["status_file"]).read_text(
+                encoding="utf-8", errors="ignore").strip().lower()
+            if "completed" in txt:
+                return "completed"
+            if "failed" in txt:
+                return "failed"
+        except Exception:
+            pass
+        return None
+
+    def _poll_send_job(self, entry_id) -> None:
+        """While the app is open, watch a detached job and update its status
+        when it finishes (or detect that it was interrupted)."""
+        entry = ResumeStore.get(entry_id)
+        if not entry or entry.get("kind") != "project_copy":
+            return
+        status = self._read_send_status(entry)
+        if status in ("completed", "failed"):
+            ResumeStore.update(entry_id, status=status)
+            self._refresh_history()
+            dest = f"{entry['dest_remote']}:{entry['dest_root']}/"
+            if status == "completed":
+                self.status_var.set(f"Background copy to {dest} completed.")
+            else:
+                self.status_var.set(
+                    f"Background copy to {dest} finished with errors — see log.")
+            return
+        if entry.get("background") and not _pid_alive(entry.get("pid")):
+            ResumeStore.update(entry_id, status="interrupted")
+            self.status_var.set(
+                f"Background copy to {entry['dest_remote']}: was interrupted — "
+                f"resume it from “Background copies…”.")
+            return
+        self.root.after(5000, lambda: self._poll_send_job(entry_id))
+
+    def _reconcile_project_copies(self) -> None:
+        """At startup: finalise finished detached jobs, mark dead ones as
+        interrupted, re-attach polling to any still running."""
+        still_running = []
+        for e in ResumeStore.list_all():
+            if e.get("kind") != "project_copy" or e.get("status") != "running":
+                continue
+            status = self._read_send_status(e)
+            if status in ("completed", "failed"):
+                ResumeStore.update(e["id"], status=status)
+            elif e.get("background") and _pid_alive(e.get("pid")):
+                still_running.append(e["id"])
+            else:
+                ResumeStore.update(e["id"], status="interrupted")
+        for jid in still_running:
+            self._poll_send_job(jid)
+        resumable = [e for e in ResumeStore.list_all()
+                     if e.get("kind") == "project_copy"
+                     and e.get("status") in ("interrupted", "stopped", "failed")]
+        if resumable:
+            self.status_var.set(
+                f"{len(resumable)} project-copy job(s) can be resumed — "
+                f"Storage → “Background copies…”.")
+
+    def _resume_send_job(self, entry) -> None:
+        """Resume an interrupted/failed job as a detached background copy.
+        rclone copy skips files already at the destination, so this continues
+        rather than restarting."""
+        entry = dict(entry)
+        entry["background"] = True
+        ResumeStore.update(
+            entry["id"], status="running", background=True,
+            resumed_at=datetime.now().isoformat(timespec="seconds"))
+        self._launch_send_detached(entry)
+
+    def _project_copies_manager(self) -> None:
+        """List project->project copy jobs with Resume / Open log / Remove."""
+        T = THEME
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Background copies — project → project")
+        dlg.transient(self.root)
+        dlg.configure(bg=T["surface"])
+        dlg.geometry("780x400")
+
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Project → project copy jobs (copy-only):",
+                  font=("Segoe UI Semibold", 10)).pack(anchor="w")
+
+        cols = ("status", "route", "started")
+        tree = ttk.Treeview(frm, columns=cols, show="headings", height=11)
+        tree.heading("status", text="Status")
+        tree.heading("route", text="From  →  To")
+        tree.heading("started", text="Started")
+        tree.column("status", width=110, anchor="w")
+        tree.column("route", width=450, anchor="w")
+        tree.column("started", width=160, anchor="w")
+        tree.pack(fill="both", expand=True, pady=(6, 6))
+
+        id_by_row = {}
+
+        def refresh():
+            tree.delete(*tree.get_children())
+            id_by_row.clear()
+            for e in ResumeStore.list_all():
+                if e.get("kind") != "project_copy":
+                    continue
+                route = (f"{e.get('src_remote')}  →  "
+                         f"{e.get('dest_remote')}:{e.get('dest_root')}/")
+                row = tree.insert("", "end",
+                                  values=(e.get("status", "?"), route,
+                                          e.get("started", "")))
+                id_by_row[row] = e["id"]
+
+        def selected_entry():
+            sel = tree.selection()
+            if not sel:
+                return None
+            return ResumeStore.get(id_by_row.get(sel[0]))
+
+        def do_resume():
+            e = selected_entry()
+            if not e:
+                messagebox.showinfo(APP_NAME, "Pick a job first.", parent=dlg)
+                return
+            if e.get("status") == "running" and _pid_alive(e.get("pid")):
+                messagebox.showinfo(
+                    APP_NAME, "That job is still running.", parent=dlg)
+                return
+            dlg.destroy()
+            self._resume_send_job(e)
+
+        def do_open_log():
+            e = selected_entry()
+            if not e:
+                return
+            self._open_path(e.get("log_file", ""))
+
+        def do_remove():
+            e = selected_entry()
+            if not e:
+                return
+            if e.get("status") == "running" and _pid_alive(e.get("pid")):
+                if not messagebox.askyesno(
+                        APP_NAME,
+                        "That job looks like it is still running. Remove it from "
+                        "the list anyway?\n(The background copy itself is not "
+                        "stopped.)", parent=dlg):
+                    return
+            ResumeStore.remove(e["id"])
+            refresh()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Resume", style="Accent.TButton",
+                   command=do_resume).pack(side="left", padx=2)
+        ttk.Button(btns, text="Open log…",
+                   command=do_open_log).pack(side="left", padx=2)
+        ttk.Button(btns, text="Remove from list",
+                   command=do_remove).pack(side="left", padx=2)
+        ttk.Button(btns, text="Refresh",
+                   command=refresh).pack(side="left", padx=2)
+        ttk.Button(btns, text="Close",
+                   command=dlg.destroy).pack(side="right", padx=2)
+
+        refresh()
+        dlg.grab_set()
 
     # ===== Generate shareable (presigned) link ============================
 
@@ -5887,6 +6259,17 @@ Built for Pawsey Acacia uploads. Free to adapt.
             # Mark resume entry as stopped so it shows up in the picker
             if self.current_resume_id:
                 ResumeStore.update(self.current_resume_id, status="stopped")
+        # Warn about an in-app (foreground) project->project copy in flight.
+        if getattr(self, "_send_fg_active", 0) > 0:
+            if not messagebox.askyesno(
+                APP_NAME,
+                "A copy to another project is still running in-app.\n"
+                "Close anyway?\n\n"
+                "(It will stop, but already-copied files stay on the destination "
+                "and you can resume it from Storage → “Background copies…”. Tip: "
+                "tick “Keep running after I close the app” next time to let it "
+                "continue in the background.)"):
+                return
         # Stop any console command still running.
         if getattr(self, "console_proc", None) is not None:
             try:
