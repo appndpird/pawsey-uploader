@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - logos are cosmetic
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Pawsey Uploader"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 APP_TAGLINE = "DPIRD · APPN  |  Pawsey Acacia object storage manager"
 
 # ---------------------------------------------------------------------------
@@ -2723,6 +2723,8 @@ class PawseyApp:
             btns, text="Paste here", command=self._storage_paste,
             style="Accent.TButton", state="disabled")
         self.storage_paste_btn.pack(side="left", padx=2)
+        ttk.Button(btns, text="📤 Send to another project…",
+                   command=self._storage_send_to_project).pack(side="left", padx=2)
         ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(btns, text="🔗 Generate link…",
                    command=self._storage_generate_link).pack(side="left", padx=2)
@@ -3835,6 +3837,240 @@ class PawseyApp:
                     APP_NAME,
                     f"Done — {verb_word.lower()}d {len(results)} item(s) into:\n"
                     f"{dest_remote}:{dest_iid}/")
+
+        self._bg_call(work, done)
+
+    # ===== Send selected items to another Pawsey project ==================
+
+    def _storage_send_to_project(self) -> None:
+        """Copy the selected buckets/folders/files to a DIFFERENT Pawsey
+        project (remote). Copy-only — nothing at the destination is ever
+        deleted. Because the two projects use different credentials the data
+        streams through this machine (download → re-upload), not server-side,
+        so large datasets are best run on a Pawsey/Nimbus VM."""
+        items = self._storage_selected_items()
+        if not items:
+            messagebox.showinfo(
+                APP_NAME,
+                "Select one or more buckets, folders or files to send to "
+                "another project first.")
+            return
+        src_remote = items[0][0]
+
+        remotes = [r for r in RcloneRemote.list_remotes() if r != src_remote]
+        if not remotes:
+            messagebox.showinfo(
+                APP_NAME,
+                "No other Pawsey project is configured to send to.\n\n"
+                "Add the recipient's project first (Settings → Pawsey projects, "
+                "or the Console), then try again. You'll need access to a bucket "
+                "on their project — either their access key + secret, or a bucket "
+                "policy that grants your key write access.")
+            return
+
+        notes = self._check_notes()
+        if not notes:
+            return
+
+        T = THEME
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Send to another project")
+        dlg.transient(self.root)
+        dlg.configure(bg=T["surface"])
+        dlg.resizable(False, False)
+
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(1, weight=1)
+
+        names = ", ".join(i.split("/")[-1] for _r, i, _t in items[:5])
+        if len(items) > 5:
+            names += f", … (+{len(items) - 5} more)"
+        ttk.Label(
+            frm, text=f"Copy {len(items)} item(s) from project “{src_remote}”:",
+            font=("Segoe UI Semibold", 10)).grid(
+                row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, text=names, style="Muted.TLabel",
+                  wraplength=440).grid(row=1, column=0, columnspan=2,
+                                       sticky="w", pady=(0, 10))
+
+        ttk.Label(frm, text="Destination project:").grid(
+            row=2, column=0, sticky="w", pady=3)
+        proj_var = tk.StringVar()
+        proj_combo = ttk.Combobox(frm, textvariable=proj_var, values=remotes,
+                                  state="readonly", width=32)
+        proj_combo.grid(row=2, column=1, sticky="ew", pady=3)
+
+        ttk.Label(frm, text="Destination bucket:").grid(
+            row=3, column=0, sticky="w", pady=3)
+        bucket_var = tk.StringVar()
+        bucket_combo = ttk.Combobox(frm, textvariable=bucket_var, width=32)
+        bucket_combo.grid(row=3, column=1, sticky="ew", pady=3)
+
+        ttk.Label(frm, text="Subfolder (optional):").grid(
+            row=4, column=0, sticky="w", pady=3)
+        subfolder_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=subfolder_var, width=34).grid(
+            row=4, column=1, sticky="ew", pady=3)
+
+        status_lbl = ttk.Label(frm, text="", style="Muted.TLabel",
+                               wraplength=440)
+        status_lbl.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 6))
+
+        warn = ("Copy only — nothing on the destination project is deleted.\n"
+                "The data is copied THROUGH this machine (download → upload), "
+                "not server-side, because the two projects use different keys. "
+                "For large datasets run this on a Pawsey/Nimbus VM rather than "
+                "a laptop.")
+        ttk.Label(frm, text=warn, foreground="#9A5B00",
+                  wraplength=440).grid(row=6, column=0, columnspan=2,
+                                       sticky="w", pady=(0, 10))
+
+        def load_buckets(*_):
+            r = proj_var.get().strip()
+            if not r:
+                return
+            bucket_var.set("")
+            bucket_combo["values"] = []
+            status_lbl.configure(text=f"Listing buckets on “{r}”…")
+
+            def work():
+                rc, out = run_rclone_capture(
+                    ["lsjson", f"{r}:", "--dirs-only"], timeout=60)
+                if rc != 0:
+                    raise RuntimeError(out)
+                data = json.loads(out or "[]")
+                return sorted(
+                    [(b.get("Name") or b.get("Path")) for b in data
+                     if (b.get("Name") or b.get("Path"))], key=str.lower)
+
+            def done(buckets, err):
+                if not dlg.winfo_exists():
+                    return
+                if err:
+                    status_lbl.configure(
+                        text=f"Could not list buckets on “{r}”: "
+                             f"{str(err)[:90]} — you can still type the name.")
+                    return
+                bucket_combo["values"] = buckets
+                if buckets:
+                    status_lbl.configure(
+                        text=f"{len(buckets)} bucket(s) on “{r}”. Pick one, or "
+                             f"type an existing bucket name.")
+                else:
+                    status_lbl.configure(
+                        text=f"No buckets visible on “{r}” (or no list "
+                             f"permission). Type the target bucket name.")
+
+            self._bg_call(work, done)
+
+        proj_var.trace_add("write", load_buckets)
+
+        def do_copy():
+            dest_remote = proj_var.get().strip()
+            dest_bucket = bucket_var.get().strip().strip("/")
+            subfolder = subfolder_var.get().strip().strip("/")
+            if not dest_remote:
+                messagebox.showerror(APP_NAME, "Pick a destination project.",
+                                     parent=dlg)
+                return
+            if not dest_bucket:
+                messagebox.showerror(
+                    APP_NAME, "Enter or pick a destination bucket.", parent=dlg)
+                return
+            dest_root = f"{dest_bucket}/{subfolder}" if subfolder else dest_bucket
+            if not messagebox.askyesno(
+                    "Confirm copy to another project",
+                    f"Copy {len(items)} item(s) from project “{src_remote}” to:\n\n"
+                    f"  {dest_remote}:{dest_root}/\n\n"
+                    f"Copy only — nothing on “{dest_remote}” is deleted.\n"
+                    f"Continue?", parent=dlg):
+                return
+            dlg.destroy()
+            self._run_send_to_project(items, src_remote, dest_remote,
+                                      dest_root, notes)
+
+        btnrow = ttk.Frame(frm)
+        btnrow.grid(row=7, column=0, columnspan=2, sticky="e", pady=(4, 0))
+        ttk.Button(btnrow, text="Cancel",
+                   command=dlg.destroy).pack(side="right", padx=2)
+        ttk.Button(btnrow, text="Copy to project", style="Accent.TButton",
+                   command=do_copy).pack(side="right", padx=2)
+
+        proj_combo.set(remotes[0])  # triggers bucket load
+        dlg.update_idletasks()
+        # Centre over the main window
+        x = self.root.winfo_rootx() + (self.root.winfo_width()
+                                       - dlg.winfo_width()) // 2
+        y = self.root.winfo_rooty() + 80
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dlg.grab_set()
+
+    def _run_send_to_project(self, items, src_remote, dest_remote,
+                             dest_root, notes) -> None:
+        """Run the cross-project copy in the background (copy-only)."""
+        self.status_var.set(
+            f"Copying {len(items)} item(s) to {dest_remote}:{dest_root}/ …")
+        self._append_log({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "operation": "send_to_project",
+            "source": f"{src_remote}: {[i for _r, i, _t in items]}",
+            "destination": f"{dest_remote}:{dest_root}",
+            "notes": notes,
+            "status": "started",
+        })
+
+        def work():
+            results = []
+            for _r, iid, type_ in items:
+                base = iid.split("/")[-1]
+                src_full = f"{src_remote}:{iid}"
+                dest_full = f"{dest_remote}:{dest_root}/{base}"
+                if type_ == "file":
+                    args = ["copyto", src_full, dest_full,
+                            "--s3-no-check-bucket"]
+                else:  # folder or whole bucket
+                    args = ["copy", src_full, dest_full,
+                            "--create-empty-src-dirs", "--s3-directory-markers",
+                            "--s3-no-check-bucket"]
+                rc, out = run_rclone_capture(args, timeout=86400)
+                results.append((iid, rc, out))
+            return results
+
+        def done(results, err):
+            if err:
+                messagebox.showerror(APP_NAME, f"Copy error:\n{err}")
+                self.status_var.set("Copy to project failed.")
+                return
+            failed = [(iid, out) for (iid, rc, out) in results if rc != 0]
+            self._append_log({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "operation": "send_to_project",
+                "destination": f"{dest_remote}:{dest_root}",
+                "status": "completed" if not failed else "partial",
+                "failed": len(failed),
+            })
+            self.storage_notes.delete("1.0", "end")
+            self._refresh_history()
+            ok = len(results) - len(failed)
+            if failed:
+                msg = "\n".join(f"  • {iid}: {out.strip()[:200]}"
+                                for iid, out in failed)
+                messagebox.showwarning(
+                    APP_NAME,
+                    f"{ok} of {len(results)} copied to {dest_remote}; "
+                    f"{len(failed)} failed:\n\n{msg}")
+                self.status_var.set(
+                    f"Copy to project finished with {len(failed)} error(s).")
+            else:
+                self.status_var.set(
+                    f"Copied {ok} item(s) to {dest_remote}:{dest_root}/.")
+                messagebox.showinfo(
+                    APP_NAME,
+                    f"Done — copied {ok} item(s) to:\n"
+                    f"{dest_remote}:{dest_root}/\n\n"
+                    f"Switch the Remote dropdown to “{dest_remote}” and refresh "
+                    f"to see them.")
 
         self._bg_call(work, done)
 

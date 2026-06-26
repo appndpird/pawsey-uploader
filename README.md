@@ -107,6 +107,7 @@ The app is designed to be left running for days:
 |---|---|
 | **Multiple Pawsey projects** — save several projects (each its own keys), mark one active, switch any time | Settings tab → Pawsey projects |
 | **Copy / Cut / Paste** files & folders on Pawsey (Windows-style; server-side move/copy, no re-upload) | Storage tab |
+| **Send to another project** — copy selected buckets/folders/files into a *different* Pawsey project's bucket (copy-only, nothing deleted) | Storage tab → "📤 Send to another project…" |
 | **Generate shareable link** with a user-chosen expiry (file → one link; folder/bucket → an HTML page of links) | Storage tab → "🔗 Generate link…" |
 | **Command console** — run any rclone (or other) command and watch live output | Console tab |
 | **Preview (dry-run)** — show changes without transferring | Transfer tab → Sync options |
@@ -164,6 +165,7 @@ build_exe.bat               # one-click Windows build script
 build_linux.sh              # one-click Linux build script
 PawseyUploader.spec         # PyInstaller build spec
 dist/PawseyUploader.exe     # prebuilt Windows executable — always the LATEST version
+dist/PawseyUploader-v1.7.exe # retained previous version
 dist/PawseyUploader-v1.6.exe # retained previous version
 dist/PawseyUploader-v1.4.exe # retained older version
 README.md                   # this file
@@ -171,13 +173,14 @@ README.md                   # this file
 
 ## Versions — which `.exe` to download
 
-The header was rebranded in **v1.7**: the **DPIRD** logo is now the larger,
-primary mark on the left and **APPN** sits top-right. Previous releases are kept
-alongside so you can always roll back or compare:
+Previous releases are kept alongside the latest so you can always roll back or
+compare. `PawseyUploader.exe` (no version suffix) is **always the latest build**;
+the running app shows its version in the title bar and on the Help tab.
 
 | File | Version | Notes |
 |---|---|---|
-| `dist/PawseyUploader.exe` | **v1.7 (latest)** | DPIRD-primary header; everything below |
+| `dist/PawseyUploader.exe` | **v1.8 (latest)** | "Send to another project" (copy data to another Pawsey project's bucket) |
+| `dist/PawseyUploader-v1.7.exe` | v1.7 | DPIRD-primary header (larger DPIRD logo left, APPN top-right) |
 | `dist/PawseyUploader-v1.6.exe` | v1.6 | Multi-project management, presigned share pages |
 | `dist/PawseyUploader-v1.4.exe` | v1.4 | Two-way sync, recycle bin, unattended operation |
 
@@ -193,8 +196,15 @@ projects** panel you can save several projects (each is an rclone S3 remote),
 active project is marked ★). You'll usually work in one project at a time, but
 having more than one lets you **copy data from one project to another**:
 
-* On the **Storage** tab — Copy/Cut in one project, switch the Remote dropdown
-  to the other, then Paste.
+* On the **Storage** tab — select what you want to send, click **"📤 Send to
+  another project…"**, pick the destination project + bucket, and copy. This is
+  **copy-only** (nothing on the destination is ever deleted) and is the
+  recommended way to hand a dataset to a collaborator who wants to analyse it in
+  the cloud on Acacia rather than downloading it. (A collaborator who only needs
+  to *download* the data, or has no Pawsey account, is better served by a
+  shareable link — see below.)
+* Or, the manual route — Copy/Cut in one project, switch the Remote dropdown to
+  the other, then Paste.
 * Or on the **Console** — `copy projectA:bucket projectB:bucket -P`.
 
 If the two projects use different keys, the data streams **through your
