@@ -22,11 +22,12 @@ __pycache__/
 *.pyo
 
 # dist/ is ignored EXCEPT the shipped Windows executables (committed deliberately).
-# PawseyUploader.exe is always the LATEST version; PawseyUploader-v<x.y>.exe are
-# the retained previous versions so users can tell releases apart.
+# The app was renamed to PDMA at v2.0; PDMA-v<x.y>.exe are the shipped releases
+# (newest = latest). The older PawseyUploader*.exe builds are kept for history.
 dist/*
 !dist/PawseyUploader.exe
 !dist/PawseyUploader-v*.exe
+!dist/PDMA-v*.exe
 
 # --- bundled rclone binary / archive (don't ship it in the repo) ---
 rclone

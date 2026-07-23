@@ -1,7 +1,10 @@
 """
-Pawsey Uploader
+Pawsey Data Management App (PDMA)
 A cross-platform (Windows / Ubuntu) GUI for managing rclone transfers to
 Pawsey Acacia object storage.
+
+(Formerly "Pawsey Uploader". The on-disk config/log folder ~/.pawsey_uploader
+is intentionally kept unchanged so existing projects and history carry over.)
 
 Features
 --------
@@ -37,6 +40,9 @@ import sys
 import tempfile
 import threading
 import urllib.parse
+import urllib.request
+import urllib.error
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -55,8 +61,8 @@ except Exception:  # pragma: no cover - logos are cosmetic
 # Constants & defaults
 # ---------------------------------------------------------------------------
 
-APP_NAME = "Pawsey Uploader"
-APP_VERSION = "1.9"
+APP_NAME = "Pawsey Data Management App (PDMA)"
+APP_VERSION = "2.1"
 APP_TAGLINE = "DPIRD · APPN  |  Pawsey Acacia object storage manager"
 
 # ---------------------------------------------------------------------------
@@ -168,7 +174,18 @@ DEFAULT_CONFIG = {
     "use_recycle_bin": True,
     "limit_deletes": True,
     "max_delete_percent": 50,
+    # --- v2.1: safety defaults + password protection ---
+    # SHA-256 hash of the app password. Empty string => the default
+    # password ("appn") is in force until the user changes it.
+    "app_password_hash": "",
+    # These safe options start ON and can only be turned OFF (or a
+    # destructive mode selected) after entering the app password.
+    "default_preview_only": True,
+    "default_verify_both": True,
 }
+
+# Factory-default password. Used until the user sets their own in Settings.
+DEFAULT_APP_PASSWORD = "appn"
 
 # Regex to parse rclone --progress lines
 PROGRESS_RE = re.compile(
@@ -470,6 +487,181 @@ def s3_presign_url(endpoint: str, region: str, access_key: str,
 
 
 # ---------------------------------------------------------------------------
+# Permanent (non-expiring) public links.
+#
+# A presigned URL (above) always expires — SigV4 caps its lifetime at 7 days,
+# so it is perfect for temporary sharing but useless for a *published* dataset
+# that must stay reachable forever. The S3-native way to get a permanent link
+# is to make the object itself publicly readable (a "public-read" ACL) and then
+# hand out the plain, unsigned object URL: https://endpoint/bucket/key . That
+# link never expires and needs no signature, because anonymous GET is allowed
+# on the object. We set the ACL with a normal SigV4-*authenticated* request
+# (Authorization header), built here with the standard library so the app keeps
+# its "no third-party packages" promise.
+#
+# Caveat: the Pawsey project/bucket must permit anonymous public reads. Some
+# Acacia buckets have public access disabled at the gateway; in that case the
+# ACL call (or the follow-up public read-back check) fails and the app tells
+# the user to ask Pawsey support to enable public access for the bucket.
+# ---------------------------------------------------------------------------
+
+
+def s3_public_url(endpoint: str, bucket: str, key: str) -> str:
+    """Plain, unsigned, path-style object URL — permanent, no signature.
+    Only actually reachable once the object has a public-read ACL."""
+    endpoint = endpoint.rstrip("/")
+    parsed = urllib.parse.urlsplit(endpoint)
+    host = parsed.netloc
+    scheme = parsed.scheme or "https"
+    key = key.lstrip("/")
+    uri = "/" + _sigv4_uri_encode(bucket, True)
+    if key:
+        uri += "/" + _sigv4_uri_encode(key, False)
+    return f"{scheme}://{host}{uri}"
+
+
+def _sigv4_authorized_request(method: str, endpoint: str, region: str,
+                              access_key: str, secret_key: str,
+                              bucket: str, key: str, *,
+                              query: str = "", body: bytes = b"",
+                              extra_headers: Optional[dict] = None,
+                              now: Optional[datetime] = None,
+                              timeout: int = 60):
+    """Issue a SigV4 header-authenticated S3 request (path-style) and return
+    (http_status, response_bytes). Raises urllib.error.* on transport failure.
+
+    `query` is the raw canonical query string (already sorted, e.g. "acl=").
+    """
+    region = region or "us-east-1"
+    service = "s3"
+    endpoint = endpoint.rstrip("/")
+    parsed = urllib.parse.urlsplit(endpoint)
+    host = parsed.netloc
+    scheme = parsed.scheme or "https"
+
+    dt = now or datetime.now(timezone.utc)
+    amzdate = dt.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = dt.strftime("%Y%m%d")
+
+    key = key.lstrip("/")
+    canonical_uri = "/" + _sigv4_uri_encode(bucket, True)
+    if key:
+        canonical_uri += "/" + _sigv4_uri_encode(key, False)
+
+    payload_hash = hashlib.sha256(body).hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amzdate,
+    }
+    for k, v in (extra_headers or {}).items():
+        headers[k.lower()] = v
+
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join(
+        f"{k}:{headers[k]}\n" for k in sorted(headers))
+    canonical_request = "\n".join([
+        method, canonical_uri, query,
+        canonical_headers, signed_headers, payload_hash,
+    ])
+
+    credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amzdate, credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+    k_date = _hmac(("AWS4" + secret_key).encode("utf-8"), datestamp)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, service)
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(
+        k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    authorization = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}")
+
+    url = f"{scheme}://{host}{canonical_uri}"
+    if query:
+        url += "?" + query
+    req = urllib.request.Request(url, data=body, method=method)
+    for k, v in headers.items():
+        if k == "host":
+            continue  # urllib sets Host itself
+        req.add_header(k, v)
+    req.add_header("Authorization", authorization)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def s3_set_public_read(endpoint: str, region: str, access_key: str,
+                       secret_key: str, bucket: str, key: str) -> tuple:
+    """Give a single object a public-read ACL so its plain URL works forever.
+    Returns (ok: bool, detail: str)."""
+    try:
+        status, body = _sigv4_authorized_request(
+            "PUT", endpoint, region, access_key, secret_key, bucket, key,
+            query="acl=", extra_headers={"x-amz-acl": "public-read"})
+    except Exception as e:  # network / TLS / DNS
+        return False, f"request failed: {e}"
+    if 200 <= status < 300:
+        return True, "public-read"
+    detail = (body or b"").decode("utf-8", "replace")[:400]
+    return False, f"HTTP {status}: {detail}"
+
+
+def s3_publish_object(endpoint: str, region: str, access_key: str,
+                      secret_key: str, bucket: str, key: str,
+                      download_name: str, content_type: str = None) -> tuple:
+    """Publish an object for permanent PUBLIC DOWNLOAD.
+
+    Does a server-side COPY of the object onto itself with
+    `x-amz-metadata-directive: REPLACE`, which lets us set — in a single
+    request, without re-uploading the data — a public-read ACL *and* a stored
+    `Content-Disposition: attachment` header. The attachment header is what
+    makes the plain, unsigned URL DOWNLOAD (instead of the browser navigating
+    to / rendering the file), so the share page's "Download folder" / "Download
+    everything" buttons work: each link downloads without unloading the page.
+
+    Returns (ok: bool, detail: str)."""
+    safe_name = (download_name or key.split("/")[-1]).replace('"', "").replace(
+        "\\", "_")
+    copy_source = "/" + _sigv4_uri_encode(bucket, True) + "/" + \
+        _sigv4_uri_encode(key.lstrip("/"), False)
+    headers = {
+        "x-amz-copy-source": copy_source,
+        "x-amz-metadata-directive": "REPLACE",
+        "x-amz-acl": "public-read",
+        "content-disposition": f'attachment; filename="{safe_name}"',
+        "content-type": content_type or "application/octet-stream",
+    }
+    try:
+        status, body = _sigv4_authorized_request(
+            "PUT", endpoint, region, access_key, secret_key, bucket, key,
+            extra_headers=headers)
+    except Exception as e:
+        return False, f"request failed: {e}"
+    if 200 <= status < 300:
+        return True, "published"
+    detail = (body or b"").decode("utf-8", "replace")[:400]
+    return False, f"HTTP {status}: {detail}"
+
+
+def s3_url_is_public(url: str, timeout: int = 20) -> bool:
+    """Anonymous GET (range 0-0) to confirm the object is world-readable."""
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Range", "bytes=0-0")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 400
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Config manager
 # ---------------------------------------------------------------------------
 
@@ -500,6 +692,27 @@ class ConfigManager:
 
     def set(self, key: str, value) -> None:
         self.data[key] = value
+
+    # ----- password helpers (v2.1) -------------------------------------
+    @staticmethod
+    def _hash_password(pw: str) -> str:
+        return hashlib.sha256(("pdma::" + (pw or "")).encode("utf-8")).hexdigest()
+
+    def check_password(self, pw: str) -> bool:
+        """True if `pw` matches the stored password (or the factory default
+        'appn' when the user has never set one)."""
+        stored = self.get("app_password_hash", "") or ""
+        if not stored:
+            stored = self._hash_password(DEFAULT_APP_PASSWORD)
+        return hmac.compare_digest(stored, self._hash_password(pw))
+
+    def set_password(self, pw: str) -> None:
+        self.set("app_password_hash", self._hash_password(pw))
+        self.save()
+
+    def is_default_password(self) -> bool:
+        """True while the app is still using the factory default password."""
+        return not (self.get("app_password_hash", "") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -1182,12 +1395,26 @@ class PawseyApp:
 
         # Preview / dry-run: rclone reports what WOULD change but transfers
         # nothing. Lets users sanity-check a Mirror or two-way sync first.
-        self.dry_run = tk.BooleanVar(value=False)
+        # v2.1: ON by default; turning it OFF is password-protected.
+        self.dry_run = tk.BooleanVar(
+            value=bool(self.cfg.get("default_preview_only", True)))
         ttk.Checkbutton(
             opts,
             text="Preview only (dry-run — show changes, transfer nothing)",
-            variable=self.dry_run).grid(
+            variable=self.dry_run,
+            command=self._on_preview_toggle).grid(
             row=5, column=2, sticky="w", padx=8, pady=(0, 6))
+
+        # v2.1: verify both sides after each transfer (rclone check). ON by
+        # default; turning it OFF is password-protected.
+        self.verify_both = tk.BooleanVar(
+            value=bool(self.cfg.get("default_verify_both", True)))
+        ttk.Checkbutton(
+            opts,
+            text="Verify both sides after each transfer (check)",
+            variable=self.verify_both,
+            command=self._on_verify_both_toggle).grid(
+            row=6, column=2, sticky="w", padx=8, pady=(0, 6))
 
         # Deletion safety cap (two-way sync). Adjustable, and can be turned
         # off. When on, a sync that would delete more than this percentage of
@@ -1234,6 +1461,9 @@ class PawseyApp:
 
         ttk.Label(mode_frame, text="Mode:", style="Big.TLabel").pack(side="left")
         self.mode_var = tk.StringVar(value="copy")
+        # Remember the last confirmed mode so a password-gated mode change
+        # (Mirror / Two-way) can be reverted if the password check fails.
+        self._prev_mode = "copy"
         ttk.Radiobutton(mode_frame, text="Copy (one-way, additive)",
                         variable=self.mode_var, value="copy",
                         command=self._on_mode_change).pack(side="left", padx=(8, 2))
@@ -1292,7 +1522,36 @@ class PawseyApp:
         if d:
             self.src_var.set(d)
 
+    # ----- v2.1 password-gated options ----------------------------------
+    def _on_preview_toggle(self) -> None:
+        """'Preview only' is a safe default. Turning it OFF needs the password."""
+        if not self.dry_run.get():          # user is trying to disable it
+            if not self._require_password("turn OFF 'Preview only'"):
+                self.dry_run.set(True)      # revert — stays protected
+
+    def _on_verify_both_toggle(self) -> None:
+        """'Verify both sides' is a safe default. Turning it OFF needs the password."""
+        if not self.verify_both.get():
+            if not self._require_password("turn OFF 'Verify both sides'"):
+                self.verify_both.set(True)
+
     def _on_mode_change(self) -> None:
+        """Update the mode hint so users know how each mode treats renames.
+
+        Mirror and Two-way sync can delete/overwrite data, so selecting them
+        is password-protected (v2.1). If the password check fails we revert
+        to the previously selected mode.
+        """
+        new_mode = self.mode_var.get()
+        protected = {"sync": "Mirror", "bisync": "Two-way sync"}
+        if new_mode in protected and new_mode != self._prev_mode:
+            if not self._require_password(f"select {protected[new_mode]} mode"):
+                self.mode_var.set(self._prev_mode)  # revert (no command fired)
+                new_mode = self._prev_mode
+        self._prev_mode = new_mode
+        return self._update_mode_hint()
+
+    def _update_mode_hint(self) -> None:
         """Update the mode hint so users know how each mode treats renames."""
         if not hasattr(self, "mode_hint"):
             return
@@ -2262,6 +2521,13 @@ class PawseyApp:
             if hasattr(self, "storage_tree") and self.storage_tree.get_children():
                 self._storage_refresh_root()
 
+            # v2.1: auto-verify both sides after a real (non-preview) transfer.
+            if (getattr(self, "verify_both", None) is not None
+                    and self.verify_both.get() and not self.dry_run.get()):
+                self._append_output(
+                    "\n=== Auto-verify (Verify both sides is ON) ===\n")
+                self.root.after(200, self._verify_check)
+
         elif self.user_stopped:
             if self.current_resume_id:
                 ResumeStore.update(self.current_resume_id, status="stopped")
@@ -2652,6 +2918,111 @@ class PawseyApp:
             pass
         self.root.after(80, self._drain_bg_queue)
 
+    # ----- password gate (v2.1) ------------------------------------------
+    def _require_password(self, action: str) -> bool:
+        """Prompt for the app password before a protected action.
+
+        Returns True if the correct password was entered, False if the user
+        cancelled or got it wrong. `action` is a short human description used
+        in the prompt, e.g. "turn off Preview only" or "select Mirror mode".
+        """
+        hint = ("  (default is 'appn' — change it in Settings)"
+                if self.cfg.is_default_password() else "")
+        pw = simpledialog.askstring(
+            "Password required",
+            f"Enter the app password to {action}.{hint}",
+            show="•", parent=self.root)
+        if pw is None:            # user cancelled
+            return False
+        if self.cfg.check_password(pw):
+            return True
+        messagebox.showerror(APP_NAME, "Incorrect password. No change was made.")
+        return False
+
+    def _bg_stream(self, args, on_line, on_done, timeout: int = 86400) -> None:
+        """Run rclone in a daemon thread, streaming each output line to
+        `on_line(line)` on the Tk main thread, then delivering the final
+        (returncode, tail_output) to `on_done(result, err)` on the main thread.
+
+        Used by the Storage tab so copy / move / delete show live progress
+        instead of appearing to hang until the whole operation finishes.
+        """
+        def runner():
+            tail: list[str] = []
+            try:
+                proc = subprocess.Popen(
+                    [RCLONE_EXE, *args], **_subprocess_kwargs())
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    tail.append(line)
+                    if len(tail) > 400:
+                        tail.pop(0)
+                    self._bg_queue.put(
+                        (lambda _r, _e, l=line: on_line(l), None, None))
+                proc.wait(timeout=timeout)
+                rc = proc.returncode
+                self._bg_queue.put((on_done, (rc, "".join(tail)), None))
+            except FileNotFoundError:
+                self._bg_queue.put((on_done, (127, "rclone not found"), None))
+            except Exception as e:
+                self._bg_queue.put((on_done, (1, str(e)), e))
+        threading.Thread(target=runner, daemon=True).start()
+
+    # ----- Storage tab progress helpers (v2.1) ---------------------------
+    def _storage_progress_begin(self, title: str, determinate: bool = True,
+                                maximum: int = 100) -> None:
+        """Reveal the Storage progress panel and reset it for a new op."""
+        if not hasattr(self, "storage_progress"):
+            return
+        self.storage_progressbar.stop()
+        if determinate:
+            self.storage_progressbar.configure(mode="determinate",
+                                               maximum=maximum, value=0)
+        else:
+            self.storage_progressbar.configure(mode="indeterminate")
+            self.storage_progressbar.start(12)
+        self.storage_progress_label.configure(text=title)
+        self.storage_op_output.configure(state="normal")
+        self.storage_op_output.delete("1.0", "end")
+        self.storage_op_output.insert(
+            "end", f"=== {title}  ({datetime.now():%H:%M:%S}) ===\n")
+        self.storage_op_output.configure(state="disabled")
+
+    def _storage_progress_set(self, value: Optional[float] = None,
+                              label: Optional[str] = None) -> None:
+        if not hasattr(self, "storage_progressbar"):
+            return
+        if value is not None:
+            self.storage_progressbar.configure(mode="determinate", value=value)
+        if label is not None:
+            self.storage_progress_label.configure(text=label)
+
+    def _storage_progress_log(self, text: str) -> None:
+        if not hasattr(self, "storage_op_output"):
+            return
+        self.storage_op_output.configure(state="normal")
+        self.storage_op_output.insert("end", text if text.endswith("\n")
+                                      else text + "\n")
+        # Keep the on-screen widget bounded.
+        end = self.storage_op_output.index("end-1c")
+        try:
+            lines = int(end.split(".")[0])
+        except Exception:
+            lines = 0
+        if lines > 500:
+            self.storage_op_output.delete("1.0", f"{lines - 400}.0")
+        self.storage_op_output.see("end")
+        self.storage_op_output.configure(state="disabled")
+
+    def _storage_progress_done(self, label: str) -> None:
+        if not hasattr(self, "storage_progressbar"):
+            return
+        self.storage_progressbar.stop()
+        self.storage_progressbar.configure(mode="determinate", maximum=100,
+                                           value=100)
+        self.storage_progress_label.configure(text=label)
+        self._storage_progress_log(f"— {label}")
+
     def _build_storage_tab(self) -> None:
         t = self.tab_storage
         t.columnconfigure(0, weight=1)
@@ -2764,7 +3135,7 @@ class PawseyApp:
         ttk.Button(btns, text="Background copies…",
                    command=self._project_copies_manager).pack(side="left", padx=2)
         ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=8)
-        ttk.Button(btns, text="🔗 Generate link…",
+        ttk.Button(btns, text="🔗 Share / Publish link…",
                    command=self._storage_generate_link).pack(side="left", padx=2)
         ttk.Button(btns, text="Rename / Move…",
                    command=self._storage_rename_move).pack(side="left", padx=2)
@@ -2789,6 +3160,28 @@ class PawseyApp:
                    style="Danger.TButton").pack(side="left", padx=12)
         ttk.Button(btns2, text="Recycle bin…",
                    command=self._storage_recycle_manager).pack(side="left", padx=2)
+
+        # ----- Operation progress panel (v2.1) -----
+        # Shows live progress for copy / cut / paste / delete / rename so the
+        # user can see that something is happening (X/N items, percentages,
+        # and streamed rclone output) instead of a frozen-looking window.
+        prog = ttk.LabelFrame(t, text="Operation progress")
+        prog.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 10))
+        prog.columnconfigure(0, weight=1)
+        self.storage_progressbar = ttk.Progressbar(
+            prog, mode="determinate", maximum=100)
+        self.storage_progressbar.grid(row=0, column=0, sticky="ew",
+                                      padx=8, pady=(8, 2))
+        self.storage_progress_label = ttk.Label(prog, text="Idle")
+        self.storage_progress_label.grid(row=1, column=0, sticky="w",
+                                        padx=8, pady=(0, 2))
+        self.storage_op_output = scrolledtext.ScrolledText(
+            prog, height=5, wrap="word",
+            font=("Consolas" if IS_WINDOWS else "Monospace", 9))
+        self.storage_op_output.grid(row=2, column=0, sticky="ew",
+                                   padx=8, pady=(0, 8))
+        self.storage_op_output.configure(state="disabled")
+        self.storage_progress = True   # marker that the panel exists
 
         # ----- State -----
         self._tree_loaded: set[str] = set()      # iids whose children are populated
@@ -3274,6 +3667,9 @@ class PawseyApp:
         self._delete_failed = 0
         self._delete_total = n
         self.status_var.set(f"Deleting {n} item(s)…")
+        self._storage_progress_begin(
+            f"{'Recycling' if soft else 'Deleting'} {n} item(s)",
+            determinate=True, maximum=n)
         self._process_next_delete()
 
     def _process_next_delete(self) -> None:
@@ -3284,6 +3680,7 @@ class PawseyApp:
                    f"Deleted {self._delete_done} item(s); "
                    f"{self._delete_failed} failed (see log).")
             self.status_var.set(msg)
+            self._storage_progress_done(msg)
             self.storage_notes.delete("1.0", "end")
             messagebox.showinfo(APP_NAME, msg)
             self._refresh_history()
@@ -3320,10 +3717,17 @@ class PawseyApp:
                 return run_rclone_capture(["deletefile", full], timeout=120)
             return run_rclone_capture(["purge", full], timeout=86400)
 
+        idx = self._delete_done + self._delete_failed + 1
+        verb = "Recycling" if soft else "Deleting"
+        self._storage_progress_set(
+            label=f"{verb} {idx}/{self._delete_total}: {iid}")
+        self._storage_progress_log(f"[{idx}/{self._delete_total}] {verb.lower()} {full} …")
+
         def done(result, err):
             ok = (not err) and result and result[0] == 0
             if ok:
                 self._delete_done += 1
+                self._storage_progress_log(f"    ✓ done: {iid}")
                 self._append_log({
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "operation": op, "target": full, "status": "completed",
@@ -3339,10 +3743,12 @@ class PawseyApp:
             else:
                 self._delete_failed += 1
                 out = (result[1] if result else str(err))
+                self._storage_progress_log(f"    ✗ FAILED: {iid}: {out.strip()[:200]}")
                 self._append_output(f"\n[delete failed] {full}: {out}\n")
+            processed = self._delete_done + self._delete_failed
+            self._storage_progress_set(value=processed)
             self.status_var.set(
-                f"Deleting… {self._delete_done + self._delete_failed}"
-                f"/{self._delete_total}")
+                f"Deleting… {processed}/{self._delete_total}")
             self._process_next_delete()
 
         self._bg_call(work, done)
@@ -3628,12 +4034,16 @@ class PawseyApp:
             "status": "started",
         })
         self.status_var.set(f"Renaming/moving {path_in_bucket} → {new_path_in_bucket}…")
+        self._storage_progress_begin(
+            f"Rename / move: {path_in_bucket} → {new_path_in_bucket}",
+            determinate=False)
 
         # Rename the local side first (fast, local). If it fails we stop and
         # do NOT touch Pawsey, so the two sides never silently diverge.
         local_done = False
         if do_local:
             import shutil
+            self._storage_progress_log(f"Renaming local copy: {local_old} → {local_new}")
             try:
                 Path(local_new).parent.mkdir(parents=True, exist_ok=True)
                 if Path(local_new).exists():
@@ -3641,7 +4051,9 @@ class PawseyApp:
                         f"Target already exists locally:\n{local_new}")
                 shutil.move(local_old, local_new)
                 local_done = True
+                self._storage_progress_log("    ✓ local copy renamed")
             except Exception as e:
+                self._storage_progress_done("Rename aborted (local step failed).")
                 messagebox.showerror(
                     APP_NAME,
                     f"Local rename failed - Pawsey was NOT changed so the two "
@@ -3649,18 +4061,24 @@ class PawseyApp:
                 self.status_var.set("Rename aborted (local step failed).")
                 return
 
-        def work():
-            # moveto for a single file, move for a directory prefix.
-            if type_ == "file":
-                args = ["moveto", src_full, dest_full]
-            else:
-                args = ["move", src_full, dest_full,
-                        "--delete-empty-src-dirs"]
-            args += ["--s3-no-check-bucket"]
-            return run_rclone_capture(args, timeout=86400)
+        self._storage_progress_log(
+            f"Moving on Pawsey (server-side): {src_full} → {dest_full}")
+
+        # moveto for a single file, move for a directory prefix.
+        if type_ == "file":
+            args = ["moveto", src_full, dest_full]
+        else:
+            args = ["move", src_full, dest_full, "--delete-empty-src-dirs"]
+        args += ["--s3-no-check-bucket", "--stats=1s", "--stats-one-line", "-v"]
+
+        def on_line(line: str):
+            line = line.rstrip("\n")
+            if line.strip():
+                self._storage_progress_log("    " + line.strip())
 
         def done(result, err):
-            if err:
+            if err and not result:
+                self._storage_progress_done("Rename/move error.")
                 messagebox.showerror(APP_NAME, f"Rename/move error:\n{err}")
                 return
             rc, out = result
@@ -3676,6 +4094,7 @@ class PawseyApp:
                 })
                 self.storage_notes.delete("1.0", "end")
                 self.status_var.set("Rename/move complete on both sides.")
+                self._storage_progress_done("Rename/move complete on both sides.")
                 msg = (f"Done - renamed/moved on Pawsey with no data transfer:\n\n"
                        f"{path_in_bucket}  →  {new_path_in_bucket}")
                 if local_done:
@@ -3694,10 +4113,11 @@ class PawseyApp:
                              f"'{Path(local_new).name}'. To get both sides "
                              f"matching, either retry this rename, or rename the "
                              f"local folder back to '{Path(local_old).name}'.")
+                self._storage_progress_done("Rename/move failed on Pawsey.")
                 messagebox.showerror(APP_NAME, f"Rename/move failed on Pawsey:\n{out}{extra}")
                 self.status_var.set("Rename/move failed on Pawsey.")
 
-        self._bg_call(work, done)
+        self._bg_stream(args, on_line, done, timeout=86400)
 
     # ===== Copy / Cut / Paste (Windows-style, server-side on Pawsey) ======
 
@@ -3812,71 +4232,135 @@ class PawseyApp:
             "status": "started",
         })
 
-        def work():
-            results = []
-            for iid, type_ in items:
-                base = iid.split("/")[-1]
-                src_full = f"{src_remote}:{iid}"
-                dest_full = f"{dest_remote}:{dest_iid}/{base}"
-                if op == "copy":
-                    if type_ == "file":
-                        args = ["copyto", src_full, dest_full]
-                    else:
-                        args = ["copy", src_full, dest_full]
-                else:  # cut → move
-                    if type_ == "file":
-                        args = ["moveto", src_full, dest_full]
-                    else:
-                        args = ["move", src_full, dest_full,
-                                "--delete-empty-src-dirs"]
-                args += ["--s3-no-check-bucket"]
-                rc, out = run_rclone_capture(args, timeout=86400)
-                results.append((iid, rc, out))
-            return results
+        # Process items one at a time, streaming rclone progress so the user
+        # sees a live percentage + X/N item counter for the whole paste.
+        self._paste_state = {
+            "queue": list(items), "op": op, "verb": verb_word,
+            "src_remote": src_remote, "dest_remote": dest_remote,
+            "dest_iid": dest_iid, "items": list(items),
+            "total": len(items), "done": 0, "failed": 0,
+            "failed_list": [],
+        }
+        self._storage_progress_begin(
+            f"{verb_word} {len(items)} item(s) → {dest_remote}:{dest_iid}/",
+            determinate=True, maximum=100)
+        self._process_next_paste()
 
-        def done(results, err):
-            if err:
-                messagebox.showerror(APP_NAME, f"Paste error:\n{err}")
-                self.status_var.set("Paste failed.")
-                return
-            failed = [(iid, out) for (iid, rc, out) in results if rc != 0]
-            self._append_log({
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "operation": f"paste_{op}",
-                "destination": f"{dest_remote}:{dest_iid}",
-                "status": "completed" if not failed else "partial",
-                "failed": len(failed),
-            })
-            self.storage_notes.delete("1.0", "end")
-            # A copy stays on the clipboard (like Windows); a cut is consumed.
-            if op == "cut":
-                self._storage_clipboard = None
-                self._update_clip_ui()
-            # Refresh destination and (for cut) the source parents.
-            self._refresh_subtree(dest_iid)
-            if op == "cut":
-                for iid, _t in items:
-                    parent = "/".join(iid.split("/")[:-1])
-                    if parent and parent != dest_iid:
-                        self._refresh_subtree(parent)
-            self._refresh_history()
-            if failed:
-                msg = "\n".join(f"  • {iid}: {out.strip()[:200]}"
-                                for iid, out in failed)
-                messagebox.showwarning(
-                    APP_NAME,
-                    f"{len(results) - len(failed)} of {len(results)} pasted; "
-                    f"{len(failed)} failed:\n\n{msg}")
-                self.status_var.set(f"Paste finished with {len(failed)} error(s).")
+    def _process_next_paste(self) -> None:
+        st = self._paste_state
+        if not st["queue"]:
+            self._finish_paste()
+            return
+
+        iid, type_ = st["queue"].pop(0)
+        idx = st["done"] + st["failed"] + 1
+        total = st["total"]
+        base = iid.split("/")[-1]
+        src_full = f"{st['src_remote']}:{iid}"
+        dest_full = f"{st['dest_remote']}:{st['dest_iid']}/{base}"
+        op = st["op"]
+        if op == "copy":
+            args = ["copyto" if type_ == "file" else "copy", src_full, dest_full]
+        else:  # cut → move
+            if type_ == "file":
+                args = ["moveto", src_full, dest_full]
             else:
-                self.status_var.set(
-                    f"Pasted {len(results)} item(s) into {dest_iid}.")
-                messagebox.showinfo(
-                    APP_NAME,
-                    f"Done — {verb_word.lower()}d {len(results)} item(s) into:\n"
-                    f"{dest_remote}:{dest_iid}/")
+                args = ["move", src_full, dest_full, "--delete-empty-src-dirs"]
+        # --stats-one-line gives a compact "Transferred: x / y, NN%" line we
+        # can parse into a percentage for the progress bar.
+        args += ["--s3-no-check-bucket", "--stats=1s", "--stats-one-line",
+                 "-v"]
 
-        self._bg_call(work, done)
+        verb = st["verb"]
+        self._storage_progress_set(
+            label=f"{verb}ing {idx}/{total}: {base}")
+        self._storage_progress_log(f"[{idx}/{total}] {verb.lower()} {iid} …")
+
+        base_frac = (idx - 1) / total * 100.0
+        span = 100.0 / total
+
+        def on_line(line: str):
+            line = line.rstrip("\n")
+            if not line.strip():
+                return
+            m = PROGRESS_RE.search(line)
+            if m:
+                try:
+                    pct = int(m.group(3))
+                    self._storage_progress_set(value=base_frac + span * pct / 100.0)
+                except Exception:
+                    pass
+                self._storage_progress_set(
+                    label=f"{verb}ing {idx}/{total}: {base} — {line.strip()}")
+            else:
+                self._storage_progress_log("    " + line.strip())
+
+        def on_done(result, err):
+            rc, out = result if result else (1, str(err))
+            if rc == 0:
+                st["done"] += 1
+                self._storage_progress_log(f"    ✓ done: {iid}")
+            else:
+                st["failed"] += 1
+                st["failed_list"].append((iid, out))
+                self._storage_progress_log(
+                    f"    ✗ FAILED: {iid}: {out.strip()[:200]}")
+            self._storage_progress_set(value=(st["done"] + st["failed"]) / total * 100.0)
+            self.status_var.set(
+                f"{verb}ing… {st['done'] + st['failed']}/{total}")
+            self._process_next_paste()
+
+        self._bg_stream(args, on_line, on_done, timeout=86400)
+
+    def _finish_paste(self) -> None:
+        st = self._paste_state
+        op = st["op"]
+        verb_word = st["verb"]
+        dest_remote = st["dest_remote"]
+        dest_iid = st["dest_iid"]
+        items = st["items"]
+        failed = st["failed_list"]
+        total = st["total"]
+        self._append_log({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "operation": f"paste_{op}",
+            "destination": f"{dest_remote}:{dest_iid}",
+            "status": "completed" if not failed else "partial",
+            "failed": len(failed),
+        })
+        self.storage_notes.delete("1.0", "end")
+        # A copy stays on the clipboard (like Windows); a cut is consumed.
+        if op == "cut":
+            self._storage_clipboard = None
+            self._update_clip_ui()
+        # Refresh destination and (for cut) the source parents.
+        self._refresh_subtree(dest_iid)
+        if op == "cut":
+            for iid, _t in items:
+                parent = "/".join(iid.split("/")[:-1])
+                if parent and parent != dest_iid:
+                    self._refresh_subtree(parent)
+        self._refresh_history()
+        if failed:
+            self._storage_progress_done(
+                f"{total - len(failed)}/{total} {verb_word.lower()}d; "
+                f"{len(failed)} failed.")
+            msg = "\n".join(f"  • {iid}: {out.strip()[:200]}"
+                            for iid, out in failed)
+            messagebox.showwarning(
+                APP_NAME,
+                f"{total - len(failed)} of {total} pasted; "
+                f"{len(failed)} failed:\n\n{msg}")
+            self.status_var.set(f"Paste finished with {len(failed)} error(s).")
+        else:
+            self._storage_progress_done(
+                f"{verb_word}d {total} item(s) into {dest_iid}.")
+            self.status_var.set(
+                f"Pasted {total} item(s) into {dest_iid}.")
+            messagebox.showinfo(
+                APP_NAME,
+                f"Done — {verb_word.lower()}d {total} item(s) into:\n"
+                f"{dest_remote}:{dest_iid}/")
 
     # ===== Send selected items to another Pawsey project ==================
 
@@ -4468,72 +4952,118 @@ class PawseyApp:
         return {"access": access, "secret": secret,
                 "endpoint": endpoint, "region": region}
 
-    def _ask_link_expiry(self) -> Optional[int]:
-        """Modal dialog: choose how long the share link stays valid.
-        Returns seconds, or None if cancelled."""
+    def _ask_link_options(self) -> Optional[dict]:
+        """Modal dialog: pick a TEMPORARY (expiring) or PERMANENT (public,
+        no-expiry) share link. Returns one of:
+            {"mode": "temporary", "secs": <int>}
+            {"mode": "permanent"}
+        or None if cancelled."""
         T = THEME
         win = tk.Toplevel(self.root)
-        win.title("Link validity")
+        win.title("Share link options")
         win.configure(bg=T["bg"])
         win.transient(self.root)
         win.resizable(False, False)
         win.grab_set()
-        result = {"secs": None}
+        result = {"value": None}
 
         frm = ttk.Frame(win, padding=16)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="How long should the share link work?",
+        ttk.Label(frm, text="How should this link work?",
                   style="Big.TLabel").grid(row=0, column=0, columnspan=3,
-                                           sticky="w", pady=(0, 10))
+                                           sticky="w", pady=(0, 12))
 
+        mode = tk.StringVar(value="temporary")
+
+        # --- Temporary option -------------------------------------------
+        ttk.Radiobutton(frm, text="Temporary link (expiring)", value="temporary",
+                        variable=mode).grid(row=1, column=0, columnspan=3,
+                                            sticky="w")
+        trow = ttk.Frame(frm)
+        trow.grid(row=2, column=0, columnspan=3, sticky="w", padx=(24, 0),
+                  pady=(2, 2))
         amount = tk.IntVar(value=7)
         unit = tk.StringVar(value="days")
-        sp = ttk.Spinbox(frm, from_=1, to=999, textvariable=amount, width=6)
-        sp.grid(row=1, column=0, sticky="w")
-        cb = ttk.Combobox(frm, textvariable=unit, width=10, state="readonly",
+        sp = ttk.Spinbox(trow, from_=1, to=999, textvariable=amount, width=6)
+        sp.pack(side="left")
+        cb = ttk.Combobox(trow, textvariable=unit, width=10, state="readonly",
                           values=["minutes", "hours", "days"])
-        cb.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        cb.pack(side="left", padx=(8, 0))
+        ttk.Label(frm, text="Stops working after this time. Best for sharing "
+                            "with collaborators or reviewers. S3's maximum is "
+                            "7 days.",
+                  style="Muted.TLabel", wraplength=430, justify="left").grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=(24, 0),
+            pady=(2, 12))
 
-        ttk.Label(frm, text="After this time the link stops working. Maximum "
-                            "allowed by S3 is 7 days.",
-                  style="Muted.TLabel", wraplength=320, justify="left").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(10, 12))
+        # --- Permanent option -------------------------------------------
+        ttk.Radiobutton(frm, text="Permanent link (public, never expires)",
+                        value="permanent", variable=mode).grid(
+            row=4, column=0, columnspan=3, sticky="w")
+        ttk.Label(frm, text="Makes the data PUBLIC on the internet with no "
+                            "expiry — anyone with the link can read it, forever, "
+                            "with no Pawsey account. Use this only for datasets "
+                            "you intend to PUBLISH. Requires the bucket to allow "
+                            "public access.",
+                  style="Muted.TLabel", wraplength=430, justify="left").grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=(24, 0),
+            pady=(2, 12))
 
         def ok():
-            mult = {"minutes": 60, "hours": 3600, "days": 86400}[unit.get()]
-            try:
-                secs = int(amount.get()) * mult
-            except Exception:
-                secs = 0
-            if secs <= 0:
-                messagebox.showerror(APP_NAME, "Enter a positive duration.",
-                                     parent=win)
-                return
-            if secs > PRESIGN_MAX_SECONDS:
-                messagebox.showinfo(
-                    APP_NAME,
-                    "S3 presigned links can last at most 7 days; capping at 7 days.",
-                    parent=win)
-                secs = PRESIGN_MAX_SECONDS
-            result["secs"] = secs
-            win.destroy()
+            if mode.get() == "temporary":
+                mult = {"minutes": 60, "hours": 3600, "days": 86400}[unit.get()]
+                try:
+                    secs = int(amount.get()) * mult
+                except Exception:
+                    secs = 0
+                if secs <= 0:
+                    messagebox.showerror(APP_NAME, "Enter a positive duration.",
+                                         parent=win)
+                    return
+                if secs > PRESIGN_MAX_SECONDS:
+                    messagebox.showinfo(
+                        APP_NAME,
+                        "S3 presigned links can last at most 7 days; "
+                        "capping at 7 days.\n\nFor a link with no expiry, choose "
+                        "the Permanent option instead.",
+                        parent=win)
+                    secs = PRESIGN_MAX_SECONDS
+                result["value"] = {"mode": "temporary", "secs": secs}
+                win.destroy()
+            else:
+                # Extra confirmation — this exposes data publicly and is a
+                # one-way action until the ACL is manually revoked.
+                if not messagebox.askyesno(
+                        APP_NAME,
+                        "Create a PERMANENT PUBLIC link?\n\n"
+                        "• The selected data will be readable by ANYONE on the "
+                        "internet, with no expiry and no account.\n"
+                        "• Only do this for datasets you intend to publish.\n"
+                        "• Never publish data containing personal, sensitive or "
+                        "embargoed information.\n\n"
+                        "Continue?", icon="warning", parent=win):
+                    return
+                result["value"] = {"mode": "permanent"}
+                win.destroy()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=3, column=0, columnspan=3, sticky="e")
+        btns.grid(row=6, column=0, columnspan=3, sticky="e", pady=(4, 0))
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=4)
         ttk.Button(btns, text="Generate link", style="Accent.TButton",
                    command=ok).pack(side="right", padx=4)
-        win.bind("<Return>", lambda e: ok())
         win.bind("<Escape>", lambda e: win.destroy())
         sp.focus_set()
         self.root.wait_window(win)
-        return result["secs"]
+        return result["value"]
 
     def _storage_generate_link(self) -> None:
-        """Create an expiring shareable link for the selected file, folder or
-        bucket. A file → one presigned URL (copied to the clipboard). A folder
-        or bucket → a local HTML page of presigned links for every file under
-        it, which the user can share/host."""
+        """Create a shareable link for the selected file, folder or bucket.
+
+        Temporary mode → S3 presigned URL(s) that expire (max 7 days).
+        Permanent mode → sets a public-read ACL and hands back the plain,
+        never-expiring object URL — for publishing datasets. A file gives one
+        link; a folder or bucket builds a browseable index page (uploaded into
+        the bucket) and returns one link to that page."""
         sel = self._storage_selection()
         if not sel:
             messagebox.showerror(
@@ -4549,34 +5079,182 @@ class PawseyApp:
                 "Configure the remote on the Settings tab (or in rclone) first.")
             return
 
-        expires = self._ask_link_expiry()
-        if not expires:
+        opts = self._ask_link_options()
+        if not opts:
             return
+        permanent = opts["mode"] == "permanent"
+        expires = None if permanent else opts["secs"]
 
         bucket = iid.split("/")[0]
         key = iid[len(bucket) + 1:]  # '' for a whole bucket
 
         if type_ == "file":
-            url = s3_presign_url(
+            if permanent:
+                self._generate_permanent_file_link(remote, bucket, key, iid,
+                                                    params)
+            else:
+                url = s3_presign_url(
+                    params["endpoint"], params["region"], params["access"],
+                    params["secret"], bucket, key, expires)
+                self._show_single_link(url, iid, expires)
+                self._append_log({
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "operation": "share_link_file",
+                    "source": f"{remote}:{iid}",
+                    "expires_seconds": expires,
+                    "status": "completed",
+                })
+                self._refresh_history()
+        else:
+            # The published page always lets recipients download the whole
+            # dataset / a folder / individual files (folder structure preserved
+            # in Chrome/Edge). For permanent datasets we ALSO offer to build a
+            # single ZIP — a one-file download that works in every browser.
+            make_zip = False
+            if permanent:
+                make_zip = messagebox.askyesno(
+                    APP_NAME,
+                    "Also build a single downloadable ZIP of the whole "
+                    "dataset?\n\n"
+                    "The published page already lets people download the whole "
+                    "dataset, a folder, or individual files (in Chrome/Edge the "
+                    "original folder structure is recreated).\n\n"
+                    "A ZIP adds a one-file download that works in EVERY browser "
+                    "— handy for citing. But:\n"
+                    "• PDMA streams every file through this machine to build it "
+                    "and uploads it into the bucket (uses extra storage ≈ the "
+                    "dataset size).\n"
+                    "• Large datasets take a while and need temporary disk "
+                    "space.\n"
+                    "• The ZIP is a snapshot — re-publish to refresh it.\n\n"
+                    "Yes = also build the ZIP.   No = page only (no ZIP).",
+                    icon="question")
+            self._generate_folder_links(remote, bucket, key, iid, params,
+                                        expires, make_zip=make_zip)
+
+    def _build_dataset_zip(self, remote, bucket, prefix, listing, label,
+                           params):
+        """Stream every listed object into one ZIP (preserving folder
+        structure), upload it into the bucket under _shares/, and publish it as
+        a permanent public download. Returns a dict on success or ("error",msg).
+
+        Streaming via `rclone cat` keeps only the finished ZIP on disk (no full
+        second copy of the tree)."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_key = f"_shares/{label}_{ts}.zip"
+        tmp_zip = Path(tempfile.gettempdir()) / f"pdma_zip_{ts}.zip"
+        n_total = len(listing)
+        flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+        try:
+            with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_STORED,
+                                 allowZip64=True) as zf:
+                for idx, f in enumerate(listing):
+                    rel = f.get("Path", "")
+                    if not rel:
+                        continue
+                    full_key = f"{prefix}/{rel}" if prefix else rel
+                    target = f"{remote}:{bucket}/{full_key}"
+                    proc = subprocess.Popen(
+                        [RCLONE_EXE, "cat", target],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        creationflags=flags)
+                    with zf.open(rel, "w") as dst:
+                        while True:
+                            chunk = proc.stdout.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                    proc.stdout.close()
+                    if proc.wait() != 0:
+                        return ("error",
+                                f"Could not read '{rel}' while building the ZIP.")
+                    if idx % 5 == 0:
+                        self.root.after(0, lambda i=idx: self.status_var.set(
+                            f"Building ZIP… {i}/{n_total} files"))
+        except Exception as e:
+            try:
+                tmp_zip.unlink()
+            except Exception:
+                pass
+            return ("error", f"ZIP build failed: {e}")
+
+        zip_size = tmp_zip.stat().st_size
+        self.root.after(0, lambda: self.status_var.set(
+            f"Uploading ZIP ({human_bytes(zip_size)})…"))
+        rc, out = run_rclone_capture(
+            ["copyto", str(tmp_zip), f"{remote}:{bucket}/{zip_key}",
+             "--s3-no-check-bucket",
+             "--header-upload", "Content-Type: application/zip"],
+            timeout=86400)
+        try:
+            tmp_zip.unlink()
+        except Exception:
+            pass
+        if rc != 0:
+            return ("error", f"Could not upload the ZIP:\n{out}")
+        ok, detail = s3_publish_object(
+            params["endpoint"], params["region"], params["access"],
+            params["secret"], bucket, zip_key,
+            download_name=f"{label}.zip", content_type="application/zip")
+        if not ok:
+            return ("error",
+                    f"ZIP uploaded but could not be made public:\n{detail}")
+        return {"url": s3_public_url(params["endpoint"], bucket, zip_key),
+                "size": zip_size, "key": zip_key}
+
+    def _generate_permanent_file_link(self, remote, bucket, key, iid, params):
+        """Set a public-read ACL on one object and return its permanent URL."""
+        self.status_var.set(f"Publishing {iid} as a permanent public link…")
+
+        def work():
+            ok, detail = s3_set_public_read(
                 params["endpoint"], params["region"], params["access"],
-                params["secret"], bucket, key, expires)
-            self._show_single_link(url, iid, expires)
+                params["secret"], bucket, key)
+            if not ok:
+                return ("error", detail)
+            url = s3_public_url(params["endpoint"], bucket, key)
+            public = s3_url_is_public(url)
+            return ("ok", {"url": url, "verified": public})
+
+        def done(result, err):
+            if err:
+                messagebox.showerror(APP_NAME,
+                                     f"Permanent link failed:\n{err}")
+                self.status_var.set("Permanent link failed.")
+                return
+            status, payload = result
+            if status == "error":
+                messagebox.showerror(
+                    APP_NAME,
+                    "Could not make this object public:\n\n"
+                    f"{payload}\n\n"
+                    "This usually means the bucket does not allow public "
+                    "access. Ask Pawsey support to enable public read for the "
+                    "bucket, or use a temporary link instead.")
+                self.status_var.set("Permanent link failed.")
+                return
             self._append_log({
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "operation": "share_link_file",
+                "operation": "publish_link_file",
                 "source": f"{remote}:{iid}",
-                "expires_seconds": expires,
+                "expires_seconds": None,
                 "status": "completed",
             })
             self._refresh_history()
-        else:
-            self._generate_folder_links(remote, bucket, key, iid, params, expires)
+            self.status_var.set("Permanent public link ready.")
+            self._show_single_link(payload["url"], iid, None,
+                                   verified=payload["verified"])
 
-    def _show_single_link(self, url: str, iid: str, expires: int,
-                          description: Optional[str] = None) -> None:
-        """Show an expiring presigned URL with a Copy button. `description`
+        self._bg_call(work, done)
+
+    def _show_single_link(self, url: str, iid: str, expires: Optional[int],
+                          description: Optional[str] = None,
+                          verified: Optional[bool] = None) -> None:
+        """Show a share URL with a Copy button. `expires` is seconds for a
+        temporary link, or None for a permanent (public) link. `description`
         explains what the link is (file vs browseable folder page)."""
         T = THEME
+        permanent = expires is None
         win = tk.Toplevel(self.root)
         win.title("Shareable link")
         win.configure(bg=T["bg"])
@@ -4584,12 +5262,23 @@ class PawseyApp:
         win.grab_set()
         frm = ttk.Frame(win, padding=16)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="Shareable link (works anywhere, expiring)",
-                  style="Big.TLabel").pack(anchor="w")
+        heading = ("Permanent public link (never expires)" if permanent
+                   else "Shareable link (works anywhere, expiring)")
+        ttk.Label(frm, text=heading, style="Big.TLabel").pack(anchor="w")
         if description is None:
-            description = (f"Direct link to this file. Send it to anyone — it "
-                           f"opens in any browser, no Pawsey account needed, "
-                           f"and expires in {self._human_duration(expires)}.")
+            if permanent:
+                description = ("Permanent public link to this file. It never "
+                               "expires and opens in any browser with no Pawsey "
+                               "account — suitable for publishing.")
+            else:
+                description = (f"Direct link to this file. Send it to anyone — it "
+                              f"opens in any browser, no Pawsey account needed, "
+                              f"and expires in {self._human_duration(expires)}.")
+        if permanent and verified is False:
+            description += ("\n\n⚠ The ACL was set, but a public read-back "
+                            "check did not succeed yet. Public visibility can "
+                            "take a moment, or the bucket may restrict anonymous "
+                            "access — test the link in a private browser window.")
         ttk.Label(frm, text=f"{iid}", style="Muted.TLabel").pack(anchor="w", pady=(2, 2))
         ttk.Label(frm, text=description, style="Muted.TLabel",
                   wraplength=620, justify="left").pack(anchor="w", pady=(0, 8))
@@ -4612,14 +5301,21 @@ class PawseyApp:
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
         copy()  # copy immediately for convenience
 
-    def _generate_folder_links(self, remote, bucket, key, iid, params, expires):
+    def _generate_folder_links(self, remote, bucket, key, iid, params, expires,
+                               make_zip=False):
         """Make ONE shareable link for a whole folder/bucket that works from any
         browser, anywhere. We build a self-contained HTML 'file browser' (expand
-        folders, view/download any file, download a whole folder at once),
-        UPLOAD it into the bucket under `_shares/`, and presign that page. The
-        single URL we hand back renders the browser for the recipient; the page
-        and every link inside it expire together."""
-        self.status_var.set(f"Building shareable page for {iid}…")
+        folders, view/download any file, download a whole folder at once) and
+        UPLOAD it into the bucket under `_shares/`.
+
+        `expires` is seconds for a TEMPORARY link (every file link + the page
+        are presigned and expire together) or None for a PERMANENT published
+        dataset (each object is given a public-read ACL and the page links use
+        plain, never-expiring URLs). `make_zip` (permanent only) also bundles
+        the whole dataset into one public ZIP and adds a one-click download."""
+        permanent = expires is None
+        noun = "published dataset" if permanent else "shareable page"
+        self.status_var.set(f"Building {noun} for {iid}…")
         src = f"{remote}:{iid}"
         prefix = key.rstrip("/")
 
@@ -4638,28 +5334,70 @@ class PawseyApp:
                 return ("error", str(e))
             if not listing:
                 return ("empty", None)
-            # Presign two URLs per file (inline 'view' + attachment 'download').
+
             files = []
-            for f in listing:
+            acl_failures = 0
+            n_total = len(listing)
+            for idx, f in enumerate(listing):
                 rel = f.get("Path", "")
                 if not rel:
                     continue
                 full_key = f"{prefix}/{rel}" if prefix else rel
-                view = s3_presign_url(
-                    params["endpoint"], params["region"], params["access"],
-                    params["secret"], bucket, full_key, expires)
-                dl = s3_presign_url(
-                    params["endpoint"], params["region"], params["access"],
-                    params["secret"], bucket, full_key, expires,
-                    download_name=rel.replace("/", "_"))
+                if permanent:
+                    # Publish: make each object public AND give it a stored
+                    # Content-Disposition: attachment so its plain URL downloads
+                    # (this is what makes "Download folder / everything" work).
+                    ok, _ = s3_publish_object(
+                        params["endpoint"], params["region"], params["access"],
+                        params["secret"], bucket, full_key,
+                        download_name=rel.replace("/", "_"),
+                        content_type=f.get("MimeType"))
+                    if not ok:
+                        # Fall back to a plain public-read ACL so at least the
+                        # per-file links still work.
+                        ok2, _ = s3_set_public_read(
+                            params["endpoint"], params["region"],
+                            params["access"], params["secret"], bucket,
+                            full_key)
+                        if not ok2:
+                            acl_failures += 1
+                    url = s3_public_url(params["endpoint"], bucket, full_key)
+                    view = dl = url
+                    if idx % 25 == 0:
+                        self.root.after(0, lambda i=idx: self.status_var.set(
+                            f"Publishing… {i}/{n_total} files"))
+                else:
+                    # Two presigned URLs per file: inline 'view' + attachment.
+                    view = s3_presign_url(
+                        params["endpoint"], params["region"], params["access"],
+                        params["secret"], bucket, full_key, expires)
+                    dl = s3_presign_url(
+                        params["endpoint"], params["region"], params["access"],
+                        params["secret"], bucket, full_key, expires,
+                        download_name=rel.replace("/", "_"))
                 files.append({"p": rel, "s": f.get("Size", 0) or 0,
                               "v": view, "d": dl})
             total = sum(f["s"] for f in files)
 
-            # Build the page and upload it INTO the bucket so the link is public.
-            html = self._build_links_html(iid, files, expires, total)
+            # If publishing and EVERY object refused a public ACL, the bucket
+            # almost certainly blocks public access — stop with clear guidance.
+            if permanent and acl_failures == len(files) and files:
+                return ("acl_denied", None)
+
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             label = (prefix or bucket).rstrip("/").split("/")[-1] or "root"
+
+            # Optionally also bundle the whole dataset into one public ZIP.
+            zip_info = None
+            if permanent and make_zip:
+                zres = self._build_dataset_zip(remote, bucket, prefix, listing,
+                                               label, params)
+                zip_info = zres if isinstance(zres, dict) else {"error": zres[1]}
+
+            # Build the page and upload it INTO the bucket so the link is public.
+            html = self._build_links_html(iid, files, expires, total,
+                                           permanent=permanent,
+                                           zip_info=zip_info)
             page_key = f"_shares/{label}_{ts}.html"
             tmp = Path(tempfile.gettempdir()) / f"pawsey_share_{ts}.html"
             try:
@@ -4677,13 +5415,26 @@ class PawseyApp:
                 pass
             if rc2 != 0:
                 return ("error", f"Could not upload the share page:\n{out2}")
-            # Presign the page itself, forcing it to render as HTML in-browser.
-            page_url = s3_presign_url(
-                params["endpoint"], params["region"], params["access"],
-                params["secret"], bucket, page_key, expires,
-                content_type="text/html; charset=utf-8")
+
+            if permanent:
+                # Make the index page itself public; its stored Content-Type
+                # (text/html, set on upload) makes the plain URL render.
+                s3_set_public_read(
+                    params["endpoint"], params["region"], params["access"],
+                    params["secret"], bucket, page_key)
+                page_url = s3_public_url(params["endpoint"], bucket, page_key)
+                verified = s3_url_is_public(page_url)
+            else:
+                # Presign the page itself, forcing it to render as HTML.
+                page_url = s3_presign_url(
+                    params["endpoint"], params["region"], params["access"],
+                    params["secret"], bucket, page_key, expires,
+                    content_type="text/html; charset=utf-8")
+                verified = None
             return ("ok", {"url": page_url, "n": len(files),
-                           "total": total, "page_key": page_key})
+                           "total": total, "page_key": page_key,
+                           "acl_failures": acl_failures, "verified": verified,
+                           "zip_info": zip_info})
 
         def done(result, err):
             if err:
@@ -4695,13 +5446,23 @@ class PawseyApp:
                 messagebox.showerror(APP_NAME, f"Could not create link:\n{payload}")
                 self.status_var.set("Link generation failed.")
                 return
+            if status == "acl_denied":
+                messagebox.showerror(
+                    APP_NAME,
+                    "Could not publish: the bucket refused public-read access "
+                    "on its objects.\n\n"
+                    "Ask Pawsey support to enable public access for this "
+                    "bucket, or use a temporary link instead.")
+                self.status_var.set("Publish failed (public access denied).")
+                return
             if status == "empty":
                 messagebox.showinfo(APP_NAME, "No files found under that folder.")
                 self.status_var.set("Ready")
                 return
             self._append_log({
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "operation": "share_link_folder",
+                "operation": "publish_link_folder" if permanent
+                             else "share_link_folder",
                 "source": src,
                 "destination": f"{remote}:{bucket}/{payload['page_key']}",
                 "files": payload["n"],
@@ -4709,16 +5470,48 @@ class PawseyApp:
                 "status": "completed",
             })
             self._refresh_history()
-            self.status_var.set(
-                f"Shareable link ready for {payload['n']} file(s).")
-            self._show_single_link(
-                payload["url"], iid, expires,
-                description=(
+            if payload.get("acl_failures"):
+                messagebox.showwarning(
+                    APP_NAME,
+                    f"{payload['acl_failures']} of {payload['n']} file(s) could "
+                    "not be made public and may not open from the link. The "
+                    "rest were published successfully.")
+            zi = payload.get("zip_info")
+            if zi and zi.get("error"):
+                messagebox.showwarning(
+                    APP_NAME,
+                    "The dataset was published, but the single-ZIP download "
+                    f"could not be built:\n\n{zi['error']}\n\n"
+                    "The page (whole-dataset / folder / file downloads) still "
+                    "works.")
+            if permanent:
+                zip_ok = bool(zi and zi.get("url"))
+                self.status_var.set(
+                    f"Published dataset ready · {payload['n']} file(s)"
+                    + (" · ZIP included." if zip_ok else "."))
+                desc = (
+                    f"Permanent published dataset · {payload['n']} file(s), "
+                    f"{human_bytes(payload['total'])}. This one link opens a "
+                    f"browseable page in any browser — anyone can download the "
+                    f"whole dataset, a folder, or individual files, with no "
+                    f"account and no expiry. Ideal for citing or publishing "
+                    f"data.")
+                if zip_ok:
+                    desc += (f" A one-click 'Download entire dataset (ZIP, "
+                             f"{human_bytes(zi['size'])})' button is also at "
+                             f"the top of the page.")
+            else:
+                self.status_var.set(
+                    f"Shareable link ready for {payload['n']} file(s).")
+                desc = (
                     f"Browseable page · {payload['n']} file(s), "
                     f"{human_bytes(payload['total'])}. Send this one link to "
                     f"anyone — it opens in any browser and lets them view or "
                     f"download files, or download whole folders. It works "
-                    f"everywhere and expires in {self._human_duration(expires)}."))
+                    f"everywhere and expires in {self._human_duration(expires)}.")
+            self._show_single_link(payload["url"], iid, expires,
+                                   description=desc,
+                                   verified=payload.get("verified"))
 
         self._bg_call(work, done)
 
@@ -4733,18 +5526,64 @@ class PawseyApp:
         m = max(1, secs // 60)
         return f"{m} minute" + ("s" if m != 1 else "")
 
-    def _build_links_html(self, title_path, files, expires, total) -> str:
-        """Self-contained file-browser page: expandable folder tree, view or
-        download any file, and one-click recursive download of any folder."""
+    def _build_links_html(self, title_path, files, expires, total,
+                          permanent: bool = False, zip_info=None) -> str:
+        """Self-contained file-browser page: expandable folder tree, download
+        any file, a folder, or the whole dataset. `permanent` switches the
+        wording/banner between an expiring share and a published (public,
+        no-expiry) dataset.
+
+        Whole-dataset / folder download preserves the original subfolder
+        structure on browsers that support the File System Access API
+        (Chrome/Edge) — the page fetches each object (same S3 host, so no CORS)
+        and writes it into a user-chosen folder, recreating subdirectories.
+        Other browsers fall back to saving files individually into Downloads
+        (folder path kept in each file's name).
+
+        `zip_info` (permanent only), when it has a 'url', also adds a one-click
+        single-ZIP download button that works in every browser."""
         T = THEME
         from html import escape
         generated = datetime.now().strftime("%Y-%m-%d %H:%M")
         # Embed the file list as JSON; neutralise any "</script>" in the data.
         data = json.dumps(files, separators=(",", ":")).replace("<", "\\u003c")
+        zip_button = ""
+        if zip_info and zip_info.get("url"):
+            zip_button = (
+                f'<a class="zipbtn" href="{escape(zip_info["url"])}">'
+                f'⬇ Download entire dataset — one ZIP '
+                f'({human_bytes(zip_info["size"])})</a>')
+        struct_note = (
+            "ℹ “Download whole dataset” / “Download folder”: in Chrome or Edge "
+            "you'll be asked to pick a destination folder once, then the "
+            "original subfolders and files are recreated there exactly as on "
+            "Pawsey. In other browsers files save individually into your "
+            "Downloads folder (the folder path is kept in each file's name); "
+            "allow “multiple downloads” if asked.")
+        if permanent:
+            title_prefix = "Published dataset"
+            meta_validity = "permanent public links (no expiry)"
+            zip_note = ("ℹ Easiest for everyone: the “Download entire dataset "
+                        "— one ZIP” button above gives the whole dataset as a "
+                        "single file (unzip to restore the folders).<br>"
+                        if zip_button else "")
+            note_html = (
+                "ℹ These are permanent public links — anyone with this page "
+                "can download the whole dataset, a folder, or individual "
+                "files, with no expiry and no account. Intended for open "
+                "access.<br>" + zip_note + struct_note)
+        else:
+            title_prefix = "Shared files"
+            meta_validity = (f"links valid for {self._human_duration(expires)} "
+                             f"from generation")
+            note_html = (
+                "⚠ These are time-limited links — anyone with this page can "
+                "download these files until the links expire. Don't post it "
+                "publicly unless that's intended.<br>" + struct_note)
         return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Shared files — {escape(title_path)}</title>
+<title>{title_prefix} — {escape(title_path)}</title>
 <style>
  :root{{--accent:{T['accent']};--accent-dark:{T['accent_dark']};
    --border:{T['border']};--muted:{T['text_muted']}}}
@@ -4783,29 +5622,29 @@ class PawseyApp:
  .sz{{color:var(--muted);font-size:12px;white-space:nowrap;min-width:80px;text-align:right}}
  .mini{{padding:3px 8px;font-size:12px}}
  .note{{color:{T['warning']};font-size:13px;margin-top:16px;line-height:1.5}}
+ .primary{{font-size:15px;padding:10px 16px;font-weight:600}}
+ .zipbtn{{display:inline-flex;align-items:center;gap:8px;background:var(--accent);
+   color:#fff;text-decoration:none;font-weight:600;font-size:15px;
+   padding:11px 18px;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,.15)}}
+ .zipbtn:hover{{background:var(--accent-dark)}}
  #toast{{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);
    background:{T['text']};color:#fff;padding:10px 18px;border-radius:8px;
    font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none}}
  #toast.show{{opacity:.95}}
 </style></head><body>
 <header>
-  <h1>📦 Shared files — {escape(title_path)}</h1>
+  <h1>📦 {title_prefix} — {escape(title_path)}</h1>
   <div class="meta">Generated {generated} · {len(files)} file(s) · {human_bytes(total)}
-    · links valid for {self._human_duration(expires)} from generation.</div>
+    · {meta_validity}.</div>
 </header>
 <main>
+  {('<div style="margin:0 0 14px">' + zip_button + '</div>') if zip_button else ''}
   <div class="toolbar">
-    <button onclick="dl('')">⬇ Download everything ({len(files)} files)</button>
+    <button class="primary" onclick="dl('')">⬇ Download whole dataset ({len(files)} files)</button>
     <input class="filter" placeholder="Filter by name…" oninput="filt(this.value)">
   </div>
   <div id="tree" class="tree"></div>
-  <p class="note">⚠ These are time-limited links — anyone with this page can
-   download these files until the links expire. Don't post it publicly unless
-   that's intended.<br>
-   ℹ Clicking a folder's “Download folder” downloads every file beneath it
-   (all subfolders included). Your browser saves them individually into your
-   Downloads folder; the original folder path is kept in each file's name.
-   Allow “multiple downloads” if your browser asks.</p>
+  <p class="note">{note_html}</p>
 </main>
 <div id="toast"></div>
 <script>
@@ -4862,16 +5701,52 @@ function renderDir(node, prefix) {{
   return html;
 }}
 document.getElementById('tree').innerHTML = renderDir(root, '');
-// ---- recursive folder download (sequential, staggered) ----
+// ---- download (whole dataset / folder / file) ----
+// Chrome/Edge (File System Access API + secure context) recreate the folder
+// structure into a user-picked directory; other browsers fall back to flat
+// per-file downloads.
+const FS_OK = ('showDirectoryPicker' in window) && window.isSecureContext;
 let toastT;
 function toast(msg) {{
   const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show');
-  clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'), 2500);
+  clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'), 3000);
+}}
+function under(prefix) {{
+  return prefix==='' ? FILES
+    : FILES.filter(f => f.p===prefix || f.p.startsWith(prefix+'/'));
 }}
 async function dl(prefix) {{
-  const sel = prefix==='' ? FILES
-    : FILES.filter(f => f.p===prefix || f.p.startsWith(prefix+'/'));
+  const sel = under(prefix);
   if (!sel.length) {{ toast('No files here.'); return; }}
+  if (FS_OK) return dlStructured(sel);
+  return dlFlat(sel);
+}}
+async function dlStructured(sel) {{
+  let dir;
+  try {{ dir = await window.showDirectoryPicker({{mode:'readwrite'}}); }}
+  catch(e) {{ toast('Cancelled.'); return; }}
+  let ok=0, fail=0;
+  for (let i=0;i<sel.length;i++) {{
+    const f = sel[i];
+    const parts = f.p.split('/');
+    const name = parts.pop();
+    try {{
+      let d = dir;
+      for (const p of parts) {{ d = await d.getDirectoryHandle(p, {{create:true}}); }}
+      const fh = await d.getFileHandle(name, {{create:true}});
+      const w = await fh.createWritable();
+      const resp = await fetch(f.d);
+      if (!resp.ok || !resp.body) throw new Error('HTTP '+resp.status);
+      await resp.body.pipeTo(w);
+      ok++;
+    }} catch(e) {{ fail++; }}
+    if (i%2===0 || i===sel.length-1)
+      toast('Saving '+(i+1)+' / '+sel.length+'…');
+  }}
+  toast('Done — '+ok+' file'+(ok!=1?'s':'')+' saved'
+        +(fail?(', '+fail+' failed'):'')+' (folders preserved).');
+}}
+async function dlFlat(sel) {{
   toast('Starting '+sel.length+' download'+(sel.length!=1?'s':'')+'…');
   for (let i=0;i<sel.length;i++) {{
     const a=document.createElement('a'); a.href=sel[i].d; a.style.display='none';
@@ -5766,12 +6641,100 @@ function filt(q) {{
             ttk.Entry(adv, textvariable=var, width=14).grid(
                 row=r, column=col * 2 + 1, sticky="w", padx=8, pady=4)
 
+        # Security / password section (v2.1)
+        sec = ttk.LabelFrame(t, text="Security  (password protects destructive "
+                                     "options)")
+        sec.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        sec.columnconfigure(1, weight=1)
+        self.s_password_status = ttk.Label(sec, text="", style="Muted.TLabel",
+                                            wraplength=760, justify="left")
+        self.s_password_status.grid(row=0, column=0, columnspan=3, sticky="w",
+                                    padx=8, pady=(8, 4))
+        secbtns = ttk.Frame(sec)
+        secbtns.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        ttk.Button(secbtns, text="Set / change password…",
+                   command=self._change_password).pack(side="left", padx=2)
+        ttk.Button(secbtns, text="Reset to default…",
+                   command=self._reset_password).pack(side="left", padx=2)
+        ttk.Label(
+            sec,
+            text="The password is required to turn OFF 'Preview only' or "
+                 "'Verify both sides', and to select Mirror or Two-way sync "
+                 "mode. Default password is 'appn'.",
+            style="Muted.TLabel", wraplength=760, justify="left").grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        self._update_password_status()
+
         ttk.Button(t, text="Save defaults",
-                   command=self._save_defaults).grid(row=4, column=1, sticky="e",
+                   command=self._save_defaults).grid(row=5, column=1, sticky="e",
                                                     padx=10, pady=(0, 10))
 
         # Populate the project picker now that all widgets exist.
         self._refresh_projects_ui()
+
+    # -------- password management (Settings tab, v2.1) --------
+    def _update_password_status(self) -> None:
+        if not hasattr(self, "s_password_status"):
+            return
+        if self.cfg.is_default_password():
+            self.s_password_status.configure(
+                text="Password: using the factory default ('appn'). "
+                     "Set your own below.")
+        else:
+            self.s_password_status.configure(
+                text="Password: a custom password is set.")
+
+    def _change_password(self) -> None:
+        current = simpledialog.askstring(
+            "Current password",
+            "Enter the CURRENT password"
+            + ("  (default is 'appn')" if self.cfg.is_default_password() else "")
+            + ":",
+            show="•", parent=self.root)
+        if current is None:
+            return
+        if not self.cfg.check_password(current):
+            messagebox.showerror(APP_NAME, "Incorrect current password.")
+            return
+        new1 = simpledialog.askstring(
+            "New password", "Enter the NEW password:", show="•",
+            parent=self.root)
+        if new1 is None:
+            return
+        new1 = new1.strip()
+        if not new1:
+            messagebox.showerror(APP_NAME, "Password cannot be empty.")
+            return
+        new2 = simpledialog.askstring(
+            "Confirm password", "Re-enter the NEW password:", show="•",
+            parent=self.root)
+        if new2 is None:
+            return
+        if new1 != new2:
+            messagebox.showerror(APP_NAME, "The two entries do not match. "
+                                           "Password unchanged.")
+            return
+        self.cfg.set_password(new1)
+        self._update_password_status()
+        messagebox.showinfo(APP_NAME, "Password changed.")
+
+    def _reset_password(self) -> None:
+        current = simpledialog.askstring(
+            "Confirm reset",
+            "Enter the CURRENT password to reset it back to the default "
+            "('appn'):",
+            show="•", parent=self.root)
+        if current is None:
+            return
+        if not self.cfg.check_password(current):
+            messagebox.showerror(APP_NAME, "Incorrect current password.")
+            return
+        # Clearing the stored hash reverts to the factory default password.
+        self.cfg.set("app_password_hash", "")
+        self.cfg.save()
+        self._update_password_status()
+        messagebox.showinfo(APP_NAME,
+                            "Password reset to the default ('appn').")
 
     # -------- rclone path helpers (used by the Settings tab) --------
     def _update_rclone_status_label(self) -> None:
@@ -5952,6 +6915,36 @@ Multiple Pawsey projects (Settings tab)
   read access to specific buckets via a bucket policy (this also enables fast
   server-side copies). Sharing raw keys works but is least secure.
 
+New in v2.1
+-----------
+  SAFER DEFAULTS: "Preview only (dry-run)" and "Verify both sides after each
+  transfer (check)" are now switched ON by default. A dry-run first shows you
+  exactly what a sync would change before anything is transferred, and the
+  auto-verify confirms both sides match after a real transfer.
+
+  PASSWORD PROTECTION (Settings > Security): a password is now required to
+    - turn OFF "Preview only" or "Verify both sides", and
+    - select the destructive Mirror or Two-way sync modes.
+  The default password is 'appn'. Set your own (or reset it back to the
+  default) under Settings > Security. Changing it asks for the current
+  password first.
+
+  STORAGE PROGRESS: copy, cut, paste, delete and rename/move on the Storage
+  tab now show a live progress bar (X/N items and a percentage) plus streamed
+  output, so you can see the operation is actually working.
+
+New in v2.0
+-----------
+  RENAMED: the app is now "Pawsey Data Management App (PDMA)" (formerly
+  "Pawsey Uploader"). Your saved projects, keys and history carry over
+  unchanged.
+
+  PERMANENT PUBLIC LINKS for publishing datasets: the "Share / Publish
+  link..." button now offers a PERMANENT option alongside the temporary
+  (expiring) one. Permanent links never expire and are ideal for datasets you
+  cite or publish. See "SHARE OR PUBLISH A LINK" below for details and the
+  safety precautions.
+
 New in v1.5
 -----------
   ORGANISE ON PAWSEY (Storage tab) - works just like Windows Explorer:
@@ -5961,21 +6954,52 @@ New in v1.5
       required for the paste. A copy stays on the clipboard (paste again
       elsewhere); a cut is cleared once pasted.
 
-  SHARE A LINK (Storage tab -> "Generate link..."):
-    - Select a file, folder or bucket and choose how long the link should
-      work (minutes / hours / days; S3's maximum is 7 days). Every link
-      works from ANY browser, anywhere - the recipient needs no Pawsey
-      account.
-    - A FILE gives one shareable link (copied to your clipboard).
-    - A FOLDER or BUCKET builds a small file-browser web page (expand
-      folders, view/download any file, or download a whole folder at once),
-      uploads that page into the bucket under "_shares/", and gives you ONE
-      link to the page. Send that single link to your end-users.
-    - These are S3 "presigned URLs" built from your stored keys - rclone's
-      own `link` command does not support expiring links on Pawsey's S3.
-      Anyone with a link can access that data until it expires. Folder
-      downloads save files individually (the folder path is kept in each
-      file's name). Tidy up old share pages from "_shares/" any time.
+  SHARE OR PUBLISH A LINK (Storage tab -> "Share / Publish link..."):
+    Select a file, folder or bucket, then choose ONE of two kinds of link.
+    Every link works from ANY browser, anywhere - the recipient needs no
+    Pawsey account.
+
+    1. TEMPORARY link (expiring) - the default, for day-to-day sharing.
+       - Choose how long it works (minutes / hours / days; S3's maximum is
+         7 days). After that the link stops working.
+       - A FILE gives one link (copied to your clipboard).
+       - A FOLDER or BUCKET builds a small file-browser web page (expand
+         folders, view/download any file, or download a whole folder at
+         once), uploads it into the bucket under "_shares/", and gives you
+         ONE link to the page.
+       - These are S3 "presigned URLs" built from your stored keys - rclone's
+         own `link` command does not support expiring links on Pawsey's S3.
+
+    2. PERMANENT link (public, never expires) - NEW in v2.0, for PUBLISHING
+       datasets that must stay reachable forever (e.g. cited in a paper).
+       - The app gives the object(s) a "public-read" ACL and hands back the
+         plain, unsigned URL (https://endpoint/bucket/key), which never
+         expires. A FOLDER/BUCKET is published as a browseable index page
+         whose links are all permanent.
+       - DOWNLOAD THE WHOLE DATASET, A FOLDER, OR SINGLE FILES: the published
+         page has a "Download whole dataset" button plus a "Download folder"
+         button on every folder. In Chrome or Edge the recipient picks a
+         destination folder once and the ORIGINAL SUBFOLDER STRUCTURE is
+         recreated on their disk (no ZIP needed); other browsers save the files
+         individually into Downloads with the folder path kept in each name.
+       - OPTIONAL SINGLE ZIP: when publishing a folder/bucket the app also
+         offers to build ONE ZIP of the whole dataset. If you say yes, the page
+         shows a "Download entire dataset - one ZIP" button too — a one-file
+         download that works in EVERY browser. The ZIP is streamed together on
+         your machine and uploaded into the bucket (extra storage ~= dataset
+         size) and is a snapshot (re-publish to refresh).
+       - This makes the data PUBLIC on the internet with no expiry. Anyone
+         with the link can read it. Only publish data that is meant to be
+         open - never anything personal, sensitive or embargoed. The app
+         asks you to confirm before publishing.
+       - Requires the bucket to ALLOW public access. If Pawsey has public
+         access disabled for the bucket, the app tells you; ask Pawsey
+         support to enable public read for that bucket.
+       - To UN-publish later, remove or overwrite the object, or ask Pawsey
+         to reset the bucket/object ACL to private.
+
+    Folder downloads save files individually (the folder path is kept in each
+    file's name). Tidy up old share/index pages from "_shares/" any time.
 
   COMMAND CONSOLE (Console tab):
     - Run any rclone command (tick 'rclone' and type just the arguments,

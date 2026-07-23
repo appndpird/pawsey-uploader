@@ -1,4 +1,9 @@
-# Pawsey Uploader
+# Pawsey Data Management App (PDMA)
+
+> **v2.0** — formerly *Pawsey Uploader*. Renamed and now able to create
+> **permanent public links** for publishing datasets (alongside the existing
+> temporary expiring links). Your saved projects, keys and history carry over
+> unchanged (the on-disk folder `~/.pawsey_uploader` is deliberately kept).
 
 A cross-platform (Windows / Ubuntu) GUI for managing rclone transfers to Pawsey
 Acacia object storage. Single-file Python 3 + Tkinter app — no third-party
@@ -108,7 +113,7 @@ The app is designed to be left running for days:
 | **Multiple Pawsey projects** — save several projects (each its own keys), mark one active, switch any time | Settings tab → Pawsey projects |
 | **Copy / Cut / Paste** files & folders on Pawsey (Windows-style; server-side move/copy, no re-upload) | Storage tab |
 | **Send to another project** — copy selected buckets/folders/files into a *different* Pawsey project's bucket (copy-only, nothing deleted) | Storage tab → "📤 Send to another project…" |
-| **Generate shareable link** with a user-chosen expiry (file → one link; folder/bucket → an HTML page of links) | Storage tab → "🔗 Generate link…" |
+| **Share / Publish link** — **temporary** (user-chosen expiry, max 7 days) *or* **permanent** (public, never expires — for publishing datasets). File → one link; folder/bucket → an HTML index page of links | Storage tab → "🔗 Share / Publish link…" |
 | **Command console** — run any rclone (or other) command and watch live output | Console tab |
 | **Preview (dry-run)** — show changes without transferring | Transfer tab → Sync options |
 | Configure / edit Pawsey remote (access key, secret, endpoint) | Settings tab |
@@ -180,7 +185,8 @@ the running app shows its version in the title bar and on the Help tab.
 
 | File | Version | Notes |
 |---|---|---|
-| `dist/PawseyUploader.exe` | **v1.9 (latest)** | Background (survives app close) + resumable "Send to another project" |
+| `dist/PDMA-v2.0.exe` | **v2.0 (latest)** | Renamed to PDMA; **permanent public links** for publishing datasets (temporary links retained) |
+| `dist/PawseyUploader.exe` | v1.9 | Background (survives app close) + resumable "Send to another project" |
 | `dist/PawseyUploader-v1.8.exe` | v1.8 | "Send to another project" (copy data to another Pawsey project's bucket) |
 | `dist/PawseyUploader-v1.7.exe` | v1.7 | DPIRD-primary header (larger DPIRD logo left, APPN top-right) |
 | `dist/PawseyUploader-v1.6.exe` | v1.6 | Multi-project management, presigned share pages |
@@ -230,14 +236,17 @@ key bucket access via a policy (which also enables fast server-side copies).
 Existing single-remote setups are migrated into this panel automatically on
 first launch — nothing to redo.
 
-## Sharing links — how it works
+## Sharing & publishing links — how it works
+
+"🔗 Share / Publish link…" offers **two kinds** of link. Both work from any
+browser, anywhere — **no Pawsey account needed** by the recipient.
+
+### Temporary link (expiring) — everyday sharing
 
 Pawsey Acacia is Ceph S3 storage, and rclone's `link` command does **not**
-support expiring public links on S3. So "🔗 Generate link…" instead builds a
+support expiring public links on S3. So the temporary option builds a
 **presigned URL**: a normal HTTPS link with a time-limited signature baked in,
 generated locally from your stored access key/secret (no third-party packages).
-Every link **works from any browser, anywhere — no Pawsey account needed** by
-the recipient.
 
 * **A file** → one presigned URL, copied to your clipboard. Send it to anyone.
 * **A folder or bucket** → the app builds a small **file-browser web page**
@@ -250,6 +259,49 @@ the recipient.
 You choose the validity (minutes / hours / days). S3's hard maximum is **7 days**;
 longer requests are capped to that. Anyone with a link can access that data
 until it expires, so don't post them publicly unless that's intended.
+
+### Permanent link (public, never expires) — publishing a dataset  *(new in v2.0)*
+
+A presigned URL can never outlive S3's 7-day signature limit, which is useless
+for a **published** dataset that must stay reachable forever (e.g. cited in a
+paper). The permanent option instead makes the object itself **publicly
+readable** — it sends an S3 `PUT ?acl` request setting a `public-read` ACL
+(SigV4-signed with the standard library, no third-party packages) — and hands
+back the plain, unsigned object URL `https://endpoint/bucket/key`, which **never
+expires**.
+
+* **A file** → its public URL (copied to your clipboard).
+* **A folder or bucket** → every object is made public and an **index page** is
+  published whose links are all permanent. The page lets the recipient download
+  the **whole dataset**, any **folder**, or **individual files**. When
+  publishing, the app also **offers to build a single ZIP** of the whole
+  dataset — if you say yes, the page shows a **"Download entire dataset — one
+  ZIP"** button as well (a one-file download that works in every browser). The
+  ZIP is streamed together on your machine and uploaded into the bucket (extra
+  storage ≈ dataset size); it's a snapshot, so re-publish to refresh it.
+
+> **How downloads work.** Published objects are stored with a
+> `Content-Disposition: attachment` header (set via a server-side
+> metadata-only copy at publish time), so every link *downloads* rather than
+> opening in the browser.
+>
+> **Preserving the folder structure.** "Download whole dataset" / "Download
+> folder" recreate the original subfolders and files on the recipient's disk —
+> in **Chrome/Edge** (via the File System Access API) they pick a destination
+> folder once and the page streams every object into it, rebuilding the tree.
+> Because the share page and the data objects are on the **same host**
+> (`projects.pawsey.org.au`), the page can fetch them directly — no CORS setup
+> needed. On **Firefox/Safari** (no File System Access API) it falls back to
+> saving each file individually into Downloads, with the folder path kept in
+> each file's name.
+
+> **Precautions.** This makes the data **public to anyone on the internet, with
+> no expiry**. The app asks you to confirm first. Only publish data that is
+> meant to be open — **never** anything personal, sensitive or embargoed. It
+> requires the bucket to **allow public access**; if Pawsey has public access
+> disabled for the bucket, the app tells you — ask `help@pawsey.org.au` to
+> enable public read. To un-publish, remove/overwrite the object or ask Pawsey
+> to reset the ACL to private.
 
 > Folder downloads: the browser saves each file individually into the
 > recipient's Downloads folder (the original folder path is preserved in each
