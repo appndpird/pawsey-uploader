@@ -69,6 +69,27 @@ Pick a mode on the **Transfer** tab:
 | **Two-way sync (OneDrive-style)** | Reconciles both sides (rclone `bisync`). Changes and deletions propagate in both directions; renames move server-side instead of re-uploading. |
 | **Resume previous…** | Re-runs a saved transfer after an interruption or restart. Multi-slot — each source/bucket pair is remembered separately. |
 
+All three transfer modes carry **empty folders** across, in both directions —
+see [Empty folders](#empty-folders) below.
+
+### Empty folders
+
+Every mode (Copy, Mirror, Two-way sync) transfers empty folders, and so do the
+Storage tab's upload / download / copy / paste / rename actions. Placeholder
+folders with nothing in them yet will exist on Pawsey after the transfer.
+
+This needs special handling because Acacia is **object storage**: a "folder" is
+not a real object, it is merely implied by the keys of the files inside it. An
+empty folder has no files to imply it, so it has nowhere to exist. The app
+therefore runs rclone with `--create-empty-src-dirs --s3-directory-markers`,
+which writes a zero-byte marker object named `<folder>/` to hold the folder
+open. rclone and the app's Storage browser both show those markers as ordinary
+folders, never as stray files, and folder deletes/moves pass the marker flag so
+no ghost folders are left behind.
+
+> **Already uploaded a dataset without its empty folders?** Just run the same
+> transfer again. Copy adds the missing folders and re-uploads no files.
+
 ### Sync options
 
 * **Conflict resolution** (two-way sync) — choose how clashes are settled:
@@ -90,7 +111,17 @@ Pick a mode on the **Transfer** tab:
   *would* copy, change or delete **without transferring or deleting anything**.
   Ideal for sanity-checking a Mirror or two-way sync before committing. (For
   the record: with this box unticked, every transfer is a real, live run — the
-  app never silently does a dry-run.)
+  app never silently does a dry-run.) A preview's summary is worded in the
+  conditional — *"WOULD add 12, update 3, …"* — so a preview can never be
+  mistaken for a real run.
+* **Verify both sides (check)** — compares source and destination and reports
+  whether they really hold the same content, transferring nothing. Two passes:
+  **files** via `rclone check` (checksums wherever Pawsey has them, size for
+  the rest — and it tells you how many could only be size-compared rather than
+  claiming a content match it didn't make), and **folders** by comparing both
+  directory trees, which is the only way to spot an empty folder present on one
+  side and missing on the other. `rclone check` looks at files only and is
+  blind to that.
 
 ## Unattended / long-running transfers
 
@@ -101,6 +132,15 @@ The app is designed to be left running for days:
 * **Smart failure detection** — authentication failures (suspended keys, bad
   credentials, `403`) and non-retryable errors (missing bucket, bisync needing
   `--resync`) stop the transfer instead of retrying pointlessly.
+* **Two-way baseline recovery** — rclone keeps its own record of what both sides
+  looked like after the last successful two-way sync, and refuses to run without
+  it (otherwise it couldn't tell *"you deleted this"* from *"the other side
+  gained it"*). If that record goes missing — an interrupted run, a cleared
+  rclone cache, a different machine — the app recognises the specific failure,
+  explains it, and offers to rebuild the baseline. The rebuild merges both sides
+  and deletes nothing; where the same file differs, the local copy wins.
+  A brand-new Pawsey destination folder is also created automatically, since
+  two-way sync will not start against a prefix that does not exist yet.
 * **Heartbeat file** — `~/.pawsey_uploader/heartbeat.json` is refreshed
   periodically so external monitoring scripts can confirm the app is alive.
 * **Per-transfer logs** — full verbose rclone output is written to disk under
@@ -166,10 +206,15 @@ On Linux, restrict permissions: `chmod 600 ~/.pawsey_uploader/config.json`
 ```
 pawsey_uploader.py          # the app
 logo_data.py                # embedded DPIRD + APPN logos (base64 PNG); bundled automatically
-build_exe.bat               # one-click Windows build script
+build_exe.bat               # one-click Windows build script — WARNING: wipes dist/
 build_linux.sh              # one-click Linux build script
-PawseyUploader.spec         # PyInstaller build spec
-dist/PawseyUploader.exe     # prebuilt Windows executable — always the LATEST version
+PDMA-v2.2.spec              # PyInstaller spec for the current release
+PDMA-v2.1.spec              # spec for the previous release
+PawseyUploader.spec         # spec from the pre-PDMA naming
+dist/PDMA-v2.2.exe          # prebuilt Windows executable — the LATEST version
+dist/PDMA-v2.1.exe          # retained previous version
+dist/PDMA-v2.0.exe          # retained previous version
+dist/PawseyUploader.exe     # retained v1.9 (last build under the old name)
 dist/PawseyUploader-v1.8.exe # retained previous version
 dist/PawseyUploader-v1.7.exe # retained previous version
 dist/PawseyUploader-v1.6.exe # retained previous version
@@ -179,22 +224,41 @@ README.md                   # this file
 
 ## Versions — which `.exe` to download
 
-Previous releases are kept alongside the latest so you can always roll back or
-compare. `PawseyUploader.exe` (no version suffix) is **always the latest build**;
-the running app shows its version in the title bar and on the Help tab.
+Every release is kept alongside the latest so you can always roll back or
+compare. **Download the highest-numbered `PDMA-v*.exe`** — that is the latest
+build. The running app shows its version in the title bar and on the Help tab,
+so you can confirm which one you launched.
 
 | File | Version | Notes |
 |---|---|---|
-| `dist/PDMA-v2.0.exe` | **v2.0 (latest)** | Renamed to PDMA; **permanent public links** for publishing datasets (temporary links retained) |
+| `dist/PDMA-v2.2.exe` | **v2.2 (latest)** | **Empty folders** now transfer in every mode and both directions; **change detection fixed** — a preview no longer reports "no changes" when it has thousands of files to move; verify compares folders too and no longer passes same-size/different-content files; two-way baseline recovery |
+| `dist/PDMA-v2.1.exe` | v2.1 | Preview-by-default, password-gated destructive modes, verify-both-sides, adjustable delete cap |
+| `dist/PDMA-v2.0.exe` | v2.0 | Renamed to PDMA; **permanent public links** for publishing datasets (temporary links retained) |
 | `dist/PawseyUploader.exe` | v1.9 | Background (survives app close) + resumable "Send to another project" |
 | `dist/PawseyUploader-v1.8.exe` | v1.8 | "Send to another project" (copy data to another Pawsey project's bucket) |
 | `dist/PawseyUploader-v1.7.exe` | v1.7 | DPIRD-primary header (larger DPIRD logo left, APPN top-right) |
 | `dist/PawseyUploader-v1.6.exe` | v1.6 | Multi-project management, presigned share pages |
 | `dist/PawseyUploader-v1.4.exe` | v1.4 | Two-way sync, recycle bin, unattended operation |
 
-`PawseyUploader.exe` (no version suffix) is **always the latest build**. The
-running app shows its version in the title bar and on the Help tab, so you can
-confirm which one you launched.
+> Note: `PawseyUploader.exe` (no version suffix) is **not** the newest build —
+> it is the last release made under the old name (v1.9). Use `PDMA-v2.2.exe`.
+
+### Rebuilding the `.exe` yourself
+
+> **Do not use `build_exe.bat` if you want to keep the older releases** — it
+> runs `rmdir /s /q dist`, which deletes every executable in `dist/`.
+
+Build a single target from its spec instead, which touches only that one file:
+
+```bat
+python -m PyInstaller PDMA-v2.2.spec --noconfirm --distpath dist
+```
+
+Use a **python.org / system Python**, not a conda env: PyInstaller in a conda
+environment can fail to bundle Tcl/Tk, and the resulting `.exe` dies at startup
+with `ImportError: DLL load failed while importing _tkinter`. A healthy build is
+~10.9 MB; a broken one is noticeably smaller (~7.8 MB) because the Tk runtime is
+missing.
 
 ## Multiple Pawsey projects
 
