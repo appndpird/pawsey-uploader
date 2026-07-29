@@ -62,7 +62,7 @@ except Exception:  # pragma: no cover - logos are cosmetic
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Pawsey Data Management App (PDMA)"
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 APP_TAGLINE = "DPIRD · APPN  |  Pawsey Acacia object storage manager"
 
 # ---------------------------------------------------------------------------
@@ -100,6 +100,13 @@ SEND_JOBS_DIR = APP_DIR / "send_jobs"                  # detached project->proje
 # Because rclone's --backup-dir also catches overwritten files, this prefix
 # doubles as version history (previous versions land here, dated).
 RECYCLE_PREFIX = "_recycle_bin"
+
+# Prefixes the app creates and manages inside a bucket. They are deliberately
+# NOT part of the user's dataset and have no local counterpart, so any
+# comparison of the two sides has to ignore them - otherwise the recycle bin
+# alone shows up as "thousands of files/folders only on Pawsey" and a perfectly
+# healthy pair looks like a mismatch.
+APP_MANAGED_PREFIXES = (RECYCLE_PREFIX, "_backups", "_shares")
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -139,9 +146,43 @@ FATAL_NONRETRYABLE_PATTERNS = (
     "Bisync critical error",
     "Bisync aborted",
     "Must run --resync to recover",
+    "cannot find prior Path1 or Path2 listings",
     "too many deletes",
     "Safety abort",
 )
+
+# Two-way sync refuses to run until rclone has a "baseline" (its record of
+# what both sides looked like after the last successful run). These strings
+# mean exactly that - the fix is a --resync, not a retry.
+BISYNC_NEEDS_RESYNC_PATTERNS = (
+    "must run --resync",
+    "cannot find prior path1 or path2 listings",
+    "prior listing file not found",
+    "--resync is required",
+)
+
+# Flags that make rclone carry EMPTY folders across, in both directions.
+#   --create-empty-src-dirs  replicate (and, for mirror sync, remove) empty
+#                            directories at the destination instead of
+#                            silently ignoring them.
+#   --s3-directory-markers   on object storage a "folder" does not exist as a
+#                            real thing; it is implied by the keys under it.
+#                            An EMPTY folder therefore has nothing to imply it
+#                            and vanishes unless rclone writes a zero-byte
+#                            marker object named "<folder>/". Without this
+#                            flag --create-empty-src-dirs has no visible
+#                            effect against Pawsey.
+# Both are needed together; the S3 flag is ignored for local-only paths.
+S3_MARKER_FLAG = "--s3-directory-markers"
+EMPTY_DIR_FLAGS = ("--create-empty-src-dirs", S3_MARKER_FLAG)
+
+# Once folder markers exist, every operation that DELETES or MOVES a folder
+# has to know about them too. Without the flag rclone cannot see a marker,
+# so purging a folder whose only content is its own marker fails outright
+# ("Object name contains unsupported characters" - it tries to delete "/")
+# and the folder stays behind as a ghost. Delete/move commands take the
+# marker flag alone; --create-empty-src-dirs is a copy-side flag.
+S3_DELETE_FLAGS = (S3_MARKER_FLAG,)
 
 # Default app config (merged with on-disk config on load)
 DEFAULT_CONFIG = {
@@ -191,6 +232,34 @@ DEFAULT_APP_PASSWORD = "appn"
 PROGRESS_RE = re.compile(
     r"Transferred:\s+([\d.]+\s*\w+)\s*/\s*([\d.]+\s*\w+),\s*(\d+)%"
 )
+
+# Log-level prefix of an rclone message line, e.g.
+#   2026/07/29 10:22:33 INFO  : sub/a.txt: Copied (new)
+#   2026/07/29 10:22:33 NOTICE: sub/a.txt: Skipped copy as --dry-run is set
+# Matched with a regex (rather than str.split) so a file whose NAME contains
+# "INFO" can't be mistaken for the level marker.
+LOG_LEVEL_RE = re.compile(r"\b(?:INFO|NOTICE)\s*:\s*")
+
+# rclone colourises some log lines (e.g. "\x1b[32mBisync successful\x1b[0m")
+# and does so even when its output is a pipe rather than a terminal. Left in
+# place, a trailing reset code breaks exact matches like line.endswith(
+# ": Deleted"), so strip the escape sequences before classifying a line.
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _app_prefix_excludes() -> list[str]:
+    """rclone --exclude args that hide the app's own bucket prefixes.
+    Both forms are needed: "p/**" drops the contents, "p/" drops the folder."""
+    args: list[str] = []
+    for p in APP_MANAGED_PREFIXES:
+        args += ["--exclude", f"{p}/**", "--exclude", f"{p}/"]
+    return args
+
+
+def _new_change_counts() -> dict:
+    """Fresh per-run change tally. 'dirs' counts folder creations/removals,
+    which is how an empty-folder-only change becomes visible."""
+    return {"new": 0, "updated": 0, "deleted": 0, "renamed": 0, "dirs": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -977,15 +1046,17 @@ class PawseyApp:
         self.fatal_error_seen = False       # non-retryable error seen
         self.delete_cap_seen = False        # bisync hit the >50% delete cap
         self.empty_listing_seen = False     # bisync saw an empty Path2 listing
+        self.bisync_needs_resync_seen = False   # bisync baseline missing/stale
         self.restart_count = 0
         self.restart_after_id: Optional[str] = None
         self._heartbeat_after_id: Optional[str] = None
         self._last_progress_text = ""
         self._transfer_log_fh = None        # per-transfer disk log file
         # Change tracking for the current transfer
-        self._change_counts = {"new": 0, "updated": 0, "deleted": 0, "renamed": 0}
+        self._change_counts = _new_change_counts()
         self._change_details: list[str] = []
         self._rename_sources: set[str] = set()
+        self._backup_dir_active = False     # set per run in _launch_rclone
         # Scheduled auto-sync
         self._autosync_after_id: Optional[str] = None
         self._autosync_params: Optional[dict] = None
@@ -1563,16 +1634,18 @@ class PawseyApp:
                      "on Pawsey (you get both). To apply a rename without "
                      "re-uploading, use Mirror or Two-way sync with 'Detect "
                      "renamed/moved files', or the Storage tab 'Rename / Move…' "
-                     "button.")
+                     "button. Empty folders ARE copied.")
         elif mode == "sync":
             self.mode_hint.configure(
                 text="Mirror makes Pawsey exactly match the source (it deletes "
-                     "extras on Pawsey). With 'Detect renamed/moved files' on, "
-                     "renames become server-side moves (no re-upload).")
+                     "extras on Pawsey, and creates/removes empty folders to "
+                     "match). With 'Detect renamed/moved files' on, renames "
+                     "become server-side moves (no re-upload).")
         elif mode == "bisync":
             self.mode_hint.configure(
-                text="Two-way sync reconciles both sides. Renames propagate as "
-                     "renames when 'Detect renamed/moved files' is on.")
+                text="Two-way sync reconciles both sides, empty folders "
+                     "included. Renames propagate as renames when 'Detect "
+                     "renamed/moved files' is on.")
         else:
             self.mode_hint.configure(text="")
 
@@ -1717,6 +1790,8 @@ class PawseyApp:
             # Two-way sync. PATH1 = local source, PATH2 = pawsey dest.
             cmd = [RCLONE_EXE, "bisync", src, dest]
             cmd += self._s3_flags(verify)
+            # Carry empty folders in BOTH directions (see EMPTY_DIR_FLAGS).
+            cmd += list(EMPTY_DIR_FLAGS)
             # Conflict resolution
             if conflict == "both":
                 cmd += ["--conflict-resolve", "none"]   # keep both, numbered
@@ -1767,6 +1842,10 @@ class PawseyApp:
         verb = "sync" if mode == "sync" else "copy"
         cmd = [RCLONE_EXE, verb, src, dest]
         cmd += self._s3_flags(verify)
+        # Carry empty folders across (see EMPTY_DIR_FLAGS). Without these an
+        # empty local folder is simply skipped, so the destination ends up
+        # with the files but not the (deliberately empty) folder structure.
+        cmd += list(EMPTY_DIR_FLAGS)
 
         # Detect renamed/moved files: rclone matches a renamed/moved file by
         # content and performs a server-side move instead of delete+re-upload.
@@ -1829,6 +1908,64 @@ class PawseyApp:
         except Exception:
             pass
 
+    def _bisync_forget_initialised(self, src: str, dest: str) -> None:
+        """Drop our 'baseline exists' note for a pair.
+
+        Called when rclone tells us the baseline is gone. Otherwise the app
+        keeps believing the pair is initialised and never offers the resync
+        the next run needs, so every attempt fails the same way."""
+        if not (src and dest):
+            return
+        try:
+            data = json.loads(BISYNC_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        key = self._bisync_key(src, dest)
+        pairs = data.get("pairs", [])
+        if key in pairs:
+            data["pairs"] = [p for p in pairs if p != key]
+            try:
+                BISYNC_STATE_FILE.write_text(json.dumps(data, indent=2),
+                                             encoding="utf-8")
+            except Exception:
+                pass
+
+    def _rebuild_bisync_baseline(self) -> None:
+        """Re-run the pair that just failed with --resync, rebuilding the
+        baseline listings so later two-way syncs work normally."""
+        src, dest = self.current_src, self.current_dest
+        if not (src and dest):
+            messagebox.showerror(APP_NAME,
+                                 "No two-way sync pair is loaded to rebuild.")
+            return
+        self._pending_bisync_mark = (src, dest)
+        self.user_stopped = False
+        self.auth_failure_seen = False
+        self.fatal_error_seen = False
+        self.delete_cap_seen = False
+        self.empty_listing_seen = False
+        self.bisync_needs_resync_seen = False
+        self.restart_count = 0
+        self._change_counts = _new_change_counts()
+        self._change_details = []
+        self._rename_sources = set()
+        self._ensure_remote_path(dest)
+        cmd = self._build_rclone_cmd("bisync", src, dest, bisync_resync=True)
+        self.current_transfer_cmd = cmd
+        if self.current_resume_id:
+            ResumeStore.update(self.current_resume_id, status="in_progress")
+        try:
+            log_path = (TRANSFER_LOG_DIR /
+                        f"transfer_{self.current_resume_id or 'resync'}.log")
+            self._transfer_log_fh = open(log_path, "a", encoding="utf-8")
+        except Exception:
+            self._transfer_log_fh = None
+        self._append_output(
+            f"\n=== Rebuilding two-way baseline (--resync) "
+            f"{datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
+        self._append_output(f"$ {' '.join(_quote(a) for a in cmd)}\n\n")
+        self._launch_rclone(cmd)
+
     # ----- name-match safety --------------------------------------------
     @staticmethod
     def _basename_of_dest(dest: str) -> str:
@@ -1840,6 +1977,61 @@ class PawseyApp:
         src_name = Path(src).name.strip().lower()
         dest_name = self._basename_of_dest(dest).strip().lower()
         return bool(src_name) and src_name == dest_name
+
+    @staticmethod
+    def _ensure_remote_path(dest: str) -> None:
+        """Make sure the destination prefix exists on Pawsey.
+
+        Two-way sync refuses to start unless BOTH sides already exist: if the
+        Pawsey prefix has no objects under it yet (a brand-new destination
+        folder) rclone reports 'error reading source root directory: directory
+        not found', raises a Bisync critical error and aborts - which reads as
+        a broken sync rather than "the folder isn't there yet".
+
+        One idempotent API call fixes it. It writes only the zero-byte folder
+        marker, never any data, and does nothing if the prefix already exists.
+        """
+        if not dest:
+            return
+        try:
+            run_rclone_capture(
+                ["mkdir", dest, "--s3-no-check-bucket", "--s3-directory-markers"],
+                timeout=120)
+        except Exception:
+            pass  # bisync will report the real problem if this didn't help
+
+    @staticmethod
+    def _purge_empty_prefix(path: str) -> bool:
+        """Clear a Pawsey prefix that has no files left under it.
+
+        After a server-side folder MOVE, rclone's --delete-empty-src-dirs
+        cannot finish the job on object storage: it logs "Removing directory"
+        but a folder marker is an object, not a directory it can rmdir, so the
+        old folder lingers as a ghost that looks like the move only half
+        happened. `purge` does remove markers, so we finish the tidy-up here.
+
+        Guarded on purpose: the prefix is listed first and nothing is purged
+        unless there are genuinely NO files under it. A move that only
+        partially succeeded therefore can never turn into a data deletion, and
+        anything we cannot verify is left strictly alone.
+
+        Returns True only if a purge actually ran and succeeded.
+        """
+        if not path:
+            return False
+        try:
+            rc, out = run_rclone_capture(
+                ["lsf", "-R", "--files-only", path], timeout=3600)
+            if rc != 0:
+                return False        # can't verify it's empty -> don't touch it
+            if any(ln.strip() for ln in out.splitlines()):
+                return False        # still holds files -> never purge
+            rc2, _ = run_rclone_capture(
+                ["purge", path, "--s3-no-check-bucket", *S3_DELETE_FLAGS],
+                timeout=3600)
+            return rc2 == 0
+        except Exception:
+            return False
 
     def _bucket_exists(self, remote: str, bucket: str):
         """Return (exists, available_buckets).
@@ -1858,9 +2050,30 @@ class PawseyApp:
         return (bucket in names), names
 
     # ----- verify both sides (rclone check) ------------------------------
+    @staticmethod
+    def _list_dir_tree(location: str) -> tuple[bool, set[str]]:
+        """Return (ok, set of every folder path under `location`).
+
+        `rclone check` compares FILES only - a folder present on one side and
+        absent on the other is completely invisible to it, which is how an
+        empty-folder difference could survive a "both sides match" verdict.
+        Listing the folders separately is the only way to compare them.
+        """
+        rc, out = run_rclone_capture(
+            ["lsf", "-R", "--dirs-only", S3_MARKER_FLAG, location,
+             *_app_prefix_excludes()],
+            timeout=86400)
+        if rc != 0:
+            return False, set()
+        # run_rclone_capture merges stderr, so keep only real listing lines
+        # (rclone's lsf --dirs-only always emits a trailing slash).
+        dirs = {ln.strip().rstrip("/") for ln in out.splitlines()
+                if ln.strip().endswith("/")}
+        return True, {d for d in dirs if d}
+
     def _verify_check(self) -> None:
-        """Run `rclone check` between the current source and destination and
-        report whether the two sides hold identical content."""
+        """Compare the current source and destination and report honestly
+        whether they hold the same content - files AND folders."""
         if self.transfer_active:
             messagebox.showinfo(APP_NAME, "Wait for the current transfer to finish first.")
             return
@@ -1877,34 +2090,105 @@ class PawseyApp:
 
         self.status_var.set("Verifying both sides…")
         self._append_output(
-            f"\n=== Verify (rclone check{' --checksum' if use_checksum else ''}) "
-            f"{datetime.now():%H:%M:%S} ===\n{src}  <->  {dest}\n\n")
+            f"\n=== Verify (rclone check{' --checksum' if use_checksum else ''}"
+            f" + folder comparison) {datetime.now():%H:%M:%S} ==="
+            f"\n{src}  <->  {dest}\n\n")
 
         def work():
-            args = ["check", src, dest, "--one-way=false"]
+            # 1. Files. Deliberately NOT --size-only: two files of the same
+            #    length with different content pass a size-only check, so the
+            #    old behaviour could report "identical content" for files that
+            #    were nothing of the sort. Plain `check` compares hashes
+            #    wherever the backend has them and falls back to size for the
+            #    rest, and tells us how many it could not hash.
+            #    The app's own prefixes (recycle bin, backups, share pages)
+            #    live in the same bucket but have no local counterpart, so
+            #    they are excluded or every verify would "find differences".
+            args = ["check", src, dest, "--one-way=false",
+                    *_app_prefix_excludes()]
             if use_checksum:
                 args.append("--checksum")
-            else:
-                args.append("--size-only")
-            return run_rclone_capture(args, timeout=86400)
+            rc, out = run_rclone_capture(args, timeout=86400)
+            # 2. Folders, including empty ones (invisible to `check`).
+            ok_src, src_dirs = self._list_dir_tree(src)
+            ok_dest, dest_dirs = self._list_dir_tree(dest)
+            return {
+                "rc": rc, "out": out,
+                "dirs_ok": ok_src and ok_dest,
+                "missing_on_dest": sorted(src_dirs - dest_dirs),
+                "missing_on_src": sorted(dest_dirs - src_dirs),
+            }
 
         def done(result, err):
             if err:
                 messagebox.showerror(APP_NAME, f"Verify error:\n{err}")
                 return
-            rc, out = result
+            rc = result["rc"]
+            out = result["out"] or ""
             self._append_output(out + "\n")
-            if rc == 0:
-                self.status_var.set("Verify: both sides match.")
-                messagebox.showinfo(APP_NAME,
-                                    "Verification passed: the two sides hold "
-                                    "identical content.")
+
+            md, ms = result["missing_on_dest"], result["missing_on_src"]
+            dirs_ok = result["dirs_ok"]
+            if not dirs_ok:
+                self._append_output(
+                    "[folder comparison] could not list one of the two sides - "
+                    "folder differences were NOT checked.\n")
+            elif md or ms:
+                self._append_output("\n--- Folder differences ---\n")
+                for d in md:
+                    self._append_output(f"[only on LOCAL]  {d}/\n")
+                for d in ms:
+                    self._append_output(f"[only on PAWSEY] {d}/\n")
+                self._append_output("\n")
             else:
-                self.status_var.set("Verify: differences found.")
+                self._append_output(
+                    "[folder comparison] folder trees match "
+                    "(including empty folders).\n")
+
+            # How many files rclone could not hash? Worth surfacing: those
+            # were compared by size alone, so the pass is weaker for them.
+            unhashed = ""
+            m = re.search(r"(\d+)\s+hashes could not be checked", out)
+            if m and m.group(1) != "0":
+                unhashed = (
+                    f"\n\nNote: {m.group(1)} file(s) had no checksum on the "
+                    f"Pawsey side and were compared by size only. Tick "
+                    f"'Verify contents with checksums' in Sync options and "
+                    f"re-upload them for a full content check.")
+
+            files_ok = (rc == 0)
+            folders_ok = dirs_ok and not md and not ms
+
+            if files_ok and folders_ok:
+                self.status_var.set("Verify: both sides match (files + folders).")
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Verification passed.\n\n"
+                    "Files match, and both sides have the same folder "
+                    "structure including empty folders." + unhashed)
+            elif files_ok and not dirs_ok:
+                self.status_var.set("Verify: files match; folders unchecked.")
                 messagebox.showwarning(
                     APP_NAME,
-                    "Verification found differences between the two sides.\n"
-                    "See the output log for the list. Run a sync to reconcile.")
+                    "Files match, but the folder lists could not be read, so "
+                    "empty folders were NOT verified.\nSee the output log."
+                    + unhashed)
+            else:
+                bits = []
+                if not files_ok:
+                    bits.append("file differences")
+                if md:
+                    bits.append(f"{len(md)} folder(s) missing on Pawsey")
+                if ms:
+                    bits.append(f"{len(ms)} folder(s) missing locally")
+                detail = ", ".join(bits)
+                self.status_var.set(f"Verify: differences found ({detail}).")
+                messagebox.showwarning(
+                    APP_NAME,
+                    f"Verification found differences between the two sides:\n\n"
+                    f"  {detail}\n\n"
+                    f"See the output log for the full list. Run a sync to "
+                    f"reconcile." + unhashed)
 
         self._bg_call(work, done)
 
@@ -2081,11 +2365,16 @@ class PawseyApp:
         self.fatal_error_seen = False
         self.delete_cap_seen = False
         self.empty_listing_seen = False
+        self.bisync_needs_resync_seen = False
         self.restart_count = 0
         # Reset change tracking for this logical transfer (not on auto-restart)
-        self._change_counts = {"new": 0, "updated": 0, "deleted": 0, "renamed": 0}
+        self._change_counts = _new_change_counts()
         self._change_details = []
         self._rename_sources = set()
+        # Two-way sync will not start against a Pawsey prefix that doesn't
+        # exist yet - create it first (folder marker only, no data).
+        if actual_mode == "bisync":
+            self._ensure_remote_path(dest)
         cmd = self._build_rclone_cmd(actual_mode, src, dest,
                                      bisync_resync=bisync_resync)
         self.current_transfer_cmd = cmd
@@ -2205,6 +2494,12 @@ class PawseyApp:
 
     def _launch_rclone(self, cmd: list[str]) -> None:
         """Internal: actually spawn the rclone subprocess and start the reader."""
+        # With a --backup-dir in force (recycle bin, or "keep both copies")
+        # rclone implements a DELETE as a move into the backup prefix, so the
+        # change sniffer must not read every move as a rename. Recorded here
+        # because this is the one funnel every launch path goes through.
+        self._backup_dir_active = any(
+            str(a).startswith("--backup-dir") for a in cmd)
         try:
             self.proc = subprocess.Popen(cmd, **_subprocess_kwargs())
         except FileNotFoundError:
@@ -2283,33 +2578,74 @@ class PawseyApp:
         self.root.after(120, self._drain_output)
 
     def _sniff_change_event(self, line: str) -> None:
-        """Classify a real per-file operation from rclone's INFO log lines.
+        """Classify a per-file (or per-folder) operation from rclone's log.
 
-        Only the actual operation lines are counted (e.g. 'name: Copied (new)',
-        'name: Deleted', 'name: Renamed from "old"'). The periodic stats blocks
-        ('Deleted:  1 (files)', 'Renamed:  1', 'Transferred: …') and bisync's
-        planning lines ('- Path1 File is new', 'Queue copy …', 'N changes:')
-        are skipped - otherwise the same change gets counted many times.
-        A rename is logged by rclone as a server-side copy + a delete + a
-        'Renamed from' line; we count it once (as renamed) and skip the
-        delete of the rename's source so it isn't double-counted."""
-        if "INFO" not in line:
-            return  # stats blocks / progress have no INFO prefix
+        Two log levels matter:
+
+          INFO    a real operation that happened - 'name: Copied (new)',
+                  'name: Deleted', 'name: Renamed from "old"' …
+          NOTICE  what a --dry-run WOULD have done - 'name: Skipped copy as
+                  --dry-run is set'. A preview run emits ONLY these, so while
+                  this parser looked at INFO alone every preview finished with
+                  a tally of zero and the app announced "No changes - both
+                  sides were already in sync" no matter how much the sync
+                  actually had to do. That is the bug this handles.
+
+        The periodic stats blocks ('Deleted:  1 (files)', 'Renamed:  1',
+        'Transferred: …') and bisync's planning lines ('- Path1 File is new',
+        'Queue copy …', 'N changes:') are skipped - otherwise the same change
+        gets counted many times. A rename is logged by rclone as a server-side
+        copy + a delete + a 'Renamed from' line; we count it once (as renamed)
+        and skip the delete of the rename's source so it isn't double-counted.
+        """
+        line = ANSI_ESCAPE_RE.sub("", line)
+        m = LOG_LEVEL_RE.search(line)
+        if not m:
+            return  # stats blocks / progress lines carry no level marker
         # Skip bisync planning + summary lines (they duplicate the operations)
         if ("- Path1" in line or "- Path2" in line or "Queue " in line
                 or "File is new" in line or "File was deleted" in line
                 or "changes:" in line or "Making map" in line
                 or "checking for diffs" in line):
             return
-        after = line.split("INFO", 1)[1].lstrip(": ").strip()
+        after = line[m.end():].strip()
         low = after.lower()
 
         def record(kind: str, text: str):
             self._change_counts[kind] += 1
             if len(self._change_details) < 2000:
-                tag = {"new": "ADD", "updated": "UPD",
-                       "deleted": "DEL", "renamed": "REN"}[kind]
+                tag = {"new": "ADD", "updated": "UPD", "deleted": "DEL",
+                       "renamed": "REN", "dirs": "DIR"}[kind]
                 self._change_details.append(f"[{tag}] {text}")
+
+        # ---- Preview (--dry-run): "Skipped <action> as --dry-run is set" ----
+        # rclone reports the action it declined to perform, so these are the
+        # changes a real run would make.
+        if "as --dry-run is set" in low:
+            # Stamping a directory's modification time is bookkeeping, not a
+            # content change - counting it would make every preview look busy.
+            if "directory modification time" in low:
+                return
+            if "skipped update" in low:
+                # e.g. 'Skipped update modification time as --dry-run is set'
+                record("updated", after)
+            elif "skipped copy" in low:
+                # A preview cannot tell new from replaced, so both land here.
+                record("new", after)
+            elif "skipped delete" in low or "skipped purge" in low:
+                record("deleted", after)
+            elif "skipped move" in low or "skipped rename" in low:
+                # A preview's move line carries no destination, so when a
+                # backup-dir is in force we cannot tell a rename from the
+                # move-instead-of-delete (or the backup of a file about to be
+                # overwritten). Count it as a deletion: over-stating the
+                # destructive column is the safe direction, and the full text
+                # of every event is listed under "Show last changes".
+                record("deleted" if getattr(self, "_backup_dir_active", False)
+                       else "renamed", after)
+            elif "skipped make directory" in low or "skipped mkdir" in low:
+                record("dirs", after)
+            return
 
         # Server-side copy is the 'copy' half of a track-renames rename.
         # Record the source name so its later 'Deleted' isn't counted, and
@@ -2319,8 +2655,19 @@ class PawseyApp:
             if src:
                 self._rename_sources.add(src)
             return
-        if "renamed from" in low or "moved to:" in low or "moved (server-side)" in low:
+        if "renamed from" in low:
             record("renamed", after)
+            return
+        if "moved to:" in low or "moved (server-side)" in low:
+            # Unlike a preview, a real run names the destination - so a move
+            # INTO the recycle bin / backup prefix can be identified for what
+            # it is: a soft delete, or the backup of a file being overwritten.
+            # Neither is a rename.
+            tail = low.split("moved", 1)[1]
+            if any(p in tail for p in APP_MANAGED_PREFIXES):
+                record("deleted", after)
+            else:
+                record("renamed", after)
             return
         # A genuine deletion - unless it's the source side of a rename/move.
         if low.endswith(": deleted") or low == "deleted" or low.endswith(" deleted"):
@@ -2336,6 +2683,14 @@ class PawseyApp:
                 or after.endswith(": Updated") or ": updated" in low):
             record("updated", after)
             return
+        # Empty-folder operations (only logged once --create-empty-src-dirs is
+        # in play, which it now always is). These are the changes that used to
+        # be invisible: a folder added or removed with no files in it.
+        if ("created directory" in low or "made directory" in low
+                or "removing directory" in low or "removed directory" in low
+                or "creating directory" in low):
+            record("dirs", after)
+            return
 
     def _handle_progress_line(self, line: str) -> None:
         m = PROGRESS_RE.search(line)
@@ -2347,6 +2702,7 @@ class PawseyApp:
             self._last_progress_text = text
 
     def _sniff_auth_failure(self, line: str) -> None:
+        line = ANSI_ESCAPE_RE.sub("", line)
         if not self.auth_failure_seen:
             for pat in AUTH_FAILURE_PATTERNS:
                 if pat in line:
@@ -2358,11 +2714,18 @@ class PawseyApp:
                 if pat.lower() in low:
                     self.fatal_error_seen = True
                     break
-        if ("too many deletes" in line.lower()
-                or "safety abort" in line.lower()):
+        low = line.lower()
+        if "too many deletes" in low or "safety abort" in low:
             self.delete_cap_seen = True
-        if "empty current path" in line.lower() and "listing" in line.lower():
+        if "empty current path" in low and "listing" in low:
             self.empty_listing_seen = True
+        # Two-way sync cannot run without its baseline listings. This is the
+        # single most common reason a bisync refuses to do anything, and the
+        # fix is a --resync rather than a retry.
+        for pat in BISYNC_NEEDS_RESYNC_PATTERNS:
+            if pat in low:
+                self.bisync_needs_resync_seen = True
+                break
 
     def _clear_output(self) -> None:
         """Clear the on-screen output only. The per-transfer log file on disk
@@ -2490,18 +2853,31 @@ class PawseyApp:
                 self._pending_bisync_mark = None
             self._cleanup_transfer_state()
 
-            # Build + record the change summary
+            # Build + record the change summary. A preview reports what WOULD
+            # change, so it is worded in the conditional - saying "Added 12"
+            # after a dry-run would be a lie.
+            was_preview = bool(getattr(self, "dry_run", None)
+                               and self.dry_run.get())
             c = self._change_counts
-            summary = (f"Added {c['new']}, updated {c['updated']}, "
-                       f"renamed/moved {c['renamed']}, deleted {c['deleted']}")
+            if was_preview:
+                summary = (f"WOULD add {c['new']}, update {c['updated']}, "
+                           f"rename/move {c['renamed']}, delete {c['deleted']}, "
+                           f"create/remove {c['dirs']} folder(s)")
+            else:
+                summary = (f"Added {c['new']}, updated {c['updated']}, "
+                           f"renamed/moved {c['renamed']}, "
+                           f"deleted {c['deleted']}, "
+                           f"folders created/removed {c['dirs']}")
             self._append_output(f"\n=== Changes this run: {summary} ===\n")
             self._append_log({
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "operation": "change_summary",
                 "resume_id": self.current_resume_id,
                 "destination": self.current_dest,
+                "preview_only": was_preview,
                 "added": c["new"], "updated": c["updated"],
                 "renamed": c["renamed"], "deleted": c["deleted"],
+                "folders": c["dirs"],
             })
 
             total_changes = sum(c.values())
@@ -2511,19 +2887,44 @@ class PawseyApp:
             # Schedule next auto-sync if enabled and this was a two-way sync
             scheduled = self._maybe_schedule_autosync()
 
-            extra = ("\n\nNo changes - both sides were already in sync."
-                     if total_changes == 0 else f"\n\nChanges: {summary}")
+            # Will the authoritative comparison run straight after this?
+            will_verify = bool(getattr(self, "verify_both", None) is not None
+                               and self.verify_both.get() and not was_preview)
+
+            if total_changes:
+                extra = f"\n\nChanges: {summary}"
+                if was_preview:
+                    extra += ("\n\nThis was a PREVIEW - nothing was transferred."
+                              "\nUntick 'Preview only (dry-run)' in Sync options "
+                              "to apply these changes.")
+            elif was_preview:
+                extra = ("\n\nPreview found nothing to do: rclone would not "
+                         "add, update, rename or delete anything, and no "
+                         "folders would change.")
+            else:
+                # Only claim the two sides match if something is going to
+                # check. rclone's log tells us what it DID, which is not the
+                # same as proof that the two sides now agree.
+                extra = "\n\nrclone reported no file or folder operations."
+                if will_verify:
+                    extra += ("\nVerifying both sides now to confirm they "
+                              "really do match…")
+                else:
+                    extra += ("\nTo confirm the two sides genuinely match, "
+                              "click 'Verify both sides (check)'.")
             if scheduled:
                 extra += (f"\n\nAuto-sync is ON - next run in "
                           f"{self.cfg.get('autosync_interval_min', 15)} min.")
-            messagebox.showinfo(APP_NAME, "Transfer completed successfully." + extra)
+            messagebox.showinfo(
+                APP_NAME,
+                ("Preview completed successfully." if was_preview
+                 else "Transfer completed successfully.") + extra)
             # Refresh the storage tree if loaded
             if hasattr(self, "storage_tree") and self.storage_tree.get_children():
                 self._storage_refresh_root()
 
             # v2.1: auto-verify both sides after a real (non-preview) transfer.
-            if (getattr(self, "verify_both", None) is not None
-                    and self.verify_both.get() and not self.dry_run.get()):
+            if will_verify:
                 self._append_output(
                     "\n=== Auto-verify (Verify both sides is ON) ===\n")
                 self.root.after(200, self._verify_check)
@@ -2584,6 +2985,33 @@ class PawseyApp:
                     "Transfer tab - it must point at where your files really "
                     "are. Fix the Path or the checkbox so it matches, then run "
                     "again (the first run will offer a baseline resync).")
+            elif self.bisync_needs_resync_seen:
+                # bisync keeps a record of what both sides looked like after
+                # the last successful run. Without it, it cannot tell "you
+                # deleted this file" apart from "the other side gained it",
+                # so it refuses to act rather than guess. Offer the rebuild.
+                self._bisync_forget_initialised(self.current_src,
+                                                self.current_dest)
+                if messagebox.askyesno(
+                        APP_NAME,
+                        "Two-way sync needs a fresh BASELINE before it can "
+                        "run.\n\n"
+                        "rclone remembers what both sides looked like at the "
+                        "end of the last successful two-way sync. That record "
+                        "is missing or unusable - usually because this is the "
+                        "first run on this machine, a previous run was "
+                        "interrupted, or the rclone cache was cleared. Without "
+                        "it rclone cannot tell a deletion apart from a new "
+                        "file, so it stops instead of guessing.\n\n"
+                        "Rebuild the baseline now?\n\n"
+                        "The rebuild MERGES the two sides: every file on "
+                        "either side is copied to the other, and where the "
+                        "same file exists on both but differs, the LOCAL copy "
+                        "wins. Nothing is deleted.\n\n"
+                        "  Yes = rebuild the baseline now\n"
+                        "  No  = change nothing (you can start the sync again "
+                        "later; it will offer the baseline)"):
+                    self._rebuild_bisync_baseline()
             else:
                 messagebox.showerror(
                     APP_NAME,
@@ -2720,10 +3148,12 @@ class PawseyApp:
         self.fatal_error_seen = False
         self.delete_cap_seen = False
         self.empty_listing_seen = False
+        self.bisync_needs_resync_seen = False
         self.restart_count = 0
-        self._change_counts = {"new": 0, "updated": 0, "deleted": 0, "renamed": 0}
+        self._change_counts = _new_change_counts()
         self._change_details = []
         self._rename_sources = set()
+        self._ensure_remote_path(dest)
         cmd = self._build_rclone_cmd("bisync", src, dest, bisync_resync=False)
         self.current_transfer_cmd = cmd
         try:
@@ -2869,7 +3299,8 @@ class PawseyApp:
             return
 
         self.status_var.set(f"Deleting bucket '{name}'...")
-        rc, out = run_rclone_capture(["purge", f"{remote}:{name}"], timeout=600)
+        rc, out = run_rclone_capture(
+            ["purge", f"{remote}:{name}", *S3_DELETE_FLAGS], timeout=600)
         if rc == 0:
             messagebox.showinfo(APP_NAME, f"Bucket '{name}' deleted.")
         else:
@@ -3538,6 +3969,7 @@ class PawseyApp:
             return run_rclone_capture(
                 ["copy", src, full_dest,
                  "--s3-no-check-bucket", "--s3-disable-checksum",
+                 *EMPTY_DIR_FLAGS,
                  "--transfers=4"],
                 timeout=86400 * 2)
 
@@ -3710,12 +4142,22 @@ class PawseyApp:
                     return run_rclone_capture(
                         ["moveto", full, trash_dest, "--s3-no-check-bucket"],
                         timeout=86400)
-                return run_rclone_capture(
+                # Folder markers must move with the folder, and the empty
+                # sub-folders inside it have to survive the trip to the
+                # recycle bin so a restore brings the structure back intact.
+                res = run_rclone_capture(
                     ["move", full, trash_dest, "--s3-no-check-bucket",
-                     "--delete-empty-src-dirs"], timeout=86400)
+                     "--delete-empty-src-dirs", *EMPTY_DIR_FLAGS],
+                    timeout=86400)
+                # rmdir cannot remove the folder's own marker, so without this
+                # a "recycled" folder would still appear (empty) where it was.
+                if res[0] == 0:
+                    self._purge_empty_prefix(full)
+                return res
             if type_ == "file":
                 return run_rclone_capture(["deletefile", full], timeout=120)
-            return run_rclone_capture(["purge", full], timeout=86400)
+            return run_rclone_capture(
+                ["purge", full, *S3_DELETE_FLAGS], timeout=86400)
 
         idx = self._delete_done + self._delete_failed + 1
         verb = "Recycling" if soft else "Deleting"
@@ -3850,7 +4292,8 @@ class PawseyApp:
             empty_btn.configure(state="disabled")
 
             def work():
-                return run_rclone_capture(["purge", trash], timeout=86400)
+                return run_rclone_capture(
+                    ["purge", trash, *S3_DELETE_FLAGS], timeout=86400)
 
             def done(result, err):
                 if err:
@@ -4068,7 +4511,10 @@ class PawseyApp:
         if type_ == "file":
             args = ["moveto", src_full, dest_full]
         else:
-            args = ["move", src_full, dest_full, "--delete-empty-src-dirs"]
+            # Carry the folder markers so empty sub-folders survive the move
+            # and the old prefix doesn't leave a ghost folder behind.
+            args = ["move", src_full, dest_full, "--delete-empty-src-dirs",
+                    *EMPTY_DIR_FLAGS]
         args += ["--s3-no-check-bucket", "--stats=1s", "--stats-one-line", "-v"]
 
         def on_line(line: str):
@@ -4083,6 +4529,12 @@ class PawseyApp:
                 return
             rc, out = result
             if rc == 0:
+                # Clear the old prefix's leftover folder marker so the
+                # renamed-away folder doesn't linger as an empty ghost.
+                if type_ != "file":
+                    if self._purge_empty_prefix(src_full):
+                        self._storage_progress_log(
+                            "    ✓ old folder marker cleared")
                 self._append_log({
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "operation": f"rename_move_{type_}",
@@ -4261,11 +4713,14 @@ class PawseyApp:
         op = st["op"]
         if op == "copy":
             args = ["copyto" if type_ == "file" else "copy", src_full, dest_full]
+            if type_ != "file":
+                args += list(EMPTY_DIR_FLAGS)   # keep empty sub-folders
         else:  # cut → move
             if type_ == "file":
                 args = ["moveto", src_full, dest_full]
             else:
-                args = ["move", src_full, dest_full, "--delete-empty-src-dirs"]
+                args = ["move", src_full, dest_full, "--delete-empty-src-dirs",
+                        *EMPTY_DIR_FLAGS]
         # --stats-one-line gives a compact "Transferred: x / y, NN%" line we
         # can parse into a percentage for the progress bar.
         args += ["--s3-no-check-bucket", "--stats=1s", "--stats-one-line",
@@ -4298,6 +4753,11 @@ class PawseyApp:
         def on_done(result, err):
             rc, out = result if result else (1, str(err))
             if rc == 0:
+                # A cut of a FOLDER leaves the source's folder marker behind
+                # (rmdir can't remove markers); clear it so the moved-from
+                # folder doesn't linger as an empty ghost.
+                if op != "copy" and type_ != "file":
+                    self._purge_empty_prefix(src_full)
                 st["done"] += 1
                 self._storage_progress_log(f"    ✓ done: {iid}")
             else:
@@ -5830,7 +6290,8 @@ function filt(q) {{
         if type_ == "file":
             cmd = ["copyto", full, local, "--s3-disable-checksum"]
         else:
-            cmd = ["copy", full, local, "--s3-disable-checksum", "--transfers=4"]
+            cmd = ["copy", full, local, "--s3-disable-checksum",
+                   *EMPTY_DIR_FLAGS, "--transfers=4"]
 
         def work():
             return run_rclone_capture(cmd, timeout=86400 * 2)
@@ -6887,6 +7348,28 @@ Getting started
      delete without transferring or removing anything. Great for checking
      a Mirror or two-way sync before you commit. (With the box unticked,
      every transfer is a real live run - the app never silently previews.)
+     A preview reports its findings in the conditional - "WOULD add 12,
+     update 3, …" - so you can always tell a preview from a real run.
+
+EMPTY FOLDERS
+-------------
+  Every mode (Copy, Mirror, Two-way sync) carries EMPTY folders across, in
+  both directions, and the Storage tab's upload/download/copy/paste actions
+  do too. If your dataset has placeholder folders with nothing in them yet,
+  they will exist on Pawsey after the transfer.
+
+  Why this needs special handling: Pawsey's Acacia is object storage, where
+  a "folder" is not a real object - it is merely implied by the keys of the
+  files inside it. An empty folder has no files to imply it, so it simply
+  has nowhere to exist. The app therefore runs rclone with
+  --create-empty-src-dirs --s3-directory-markers, which writes a zero-byte
+  marker object named "<folder>/" to hold the folder open. rclone (and this
+  app's Storage browser) shows those markers as ordinary folders, not as
+  stray files.
+
+  If you already uploaded a dataset before this behaviour was in place, the
+  empty folders are missing on Pawsey. Just run the same transfer again -
+  Copy will add the missing folders without re-uploading any files.
 
 Multiple Pawsey projects (Settings tab)
 ---------------------------------------
@@ -7030,9 +7513,18 @@ Sync options (apply to the modes above)
     the source/destination so the names match, or untick this option to
     deliberately sync differently-named folders. This stops you
     accidentally syncing the wrong project into the wrong place.
-  - "Verify both sides (check)" button: runs `rclone check` between the
-    current source and destination and reports whether they hold
-    identical content - without transferring anything.
+  - "Verify both sides (check)" button: compares the current source and
+    destination and reports whether they really hold the same content -
+    without transferring anything. It does two passes:
+      * FILES via `rclone check`, comparing checksums wherever Pawsey has
+        them and falling back to size for the rest. If some files could
+        only be compared by size, it says so and tells you how many -
+        it never claims a full content match it did not make.
+      * FOLDERS by listing both directory trees, which is the only way to
+        catch an EMPTY folder present on one side and missing on the other
+        (`rclone check` looks at files only and cannot see this).
+    Tick "Verify contents with checksums" in Sync options and re-upload if
+    you want every file checked by content rather than by size.
 
 Two-way sync notes (important)
 ------------------------------
@@ -7045,6 +7537,18 @@ Two-way sync notes (important)
     project. The app remembers which pairs are initialised in
     bisync_pairs.json. Resuming a two-way sync never re-runs the
     baseline (that would discard remote-only changes).
+  - IF THE BASELINE GOES MISSING: rclone keeps its own record of what both
+    sides looked like after the last successful run, and it refuses to sync
+    without it - otherwise it could not tell "you deleted this file" apart
+    from "the other side gained it". That record can disappear if a run was
+    interrupted, the rclone cache was cleared, or you moved to another
+    machine. The app now recognises this specific failure, explains it, and
+    offers to rebuild the baseline for you (the rebuild merges both sides
+    and deletes nothing; where the same file differs, the local copy wins).
+  - AFTER A TWO-WAY SYNC REPORTS "no changes", you can confirm it with the
+    "Verify both sides (check)" button. The run summary only reports what
+    rclone actually did; the verify button is what proves the two sides
+    genuinely match.
   - A deletion safety cap protects against accidental mass-deletion in
     two-way sync. By default a sync that would delete more than 50% of the
     files on either side is aborted before anything is removed. You can
