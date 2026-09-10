@@ -39,6 +39,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
+import getpass
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -62,7 +64,7 @@ except Exception:  # pragma: no cover - logos are cosmetic
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Pawsey Data Management App (PDMA)"
-APP_VERSION = "2.2"
+APP_VERSION = "2.4"
 APP_TAGLINE = "DPIRD · APPN  |  Pawsey Acacia object storage manager"
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,24 @@ HEARTBEAT_FILE = APP_DIR / "heartbeat.json"            # liveness for external t
 TRANSFER_LOG_DIR = APP_DIR / "logs"                    # per-transfer verbose logs
 BISYNC_STATE_FILE = APP_DIR / "bisync_pairs.json"      # which pairs are initialised
 SEND_JOBS_DIR = APP_DIR / "send_jobs"                  # detached project->project copy jobs
+# v2.3.1: diagnostics. The .exe has no console, so until now a failing rclone
+# call or a crashed UI callback left no trace anywhere - "it can't upload" was
+# impossible to investigate after the fact. Every rclone call that exits
+# non-zero, every uncaught exception, and each app start is appended here.
+DIAG_LOG = APP_DIR / "app_errors.log"
+_DIAG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _diag(msg: str) -> None:
+    """Append one timestamped line to the diagnostics log. Never raises."""
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        if DIAG_LOG.exists() and DIAG_LOG.stat().st_size > _DIAG_MAX_BYTES:
+            DIAG_LOG.replace(DIAG_LOG.with_suffix(".log.1"))
+        with open(DIAG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except Exception:
+        pass
 
 # Soft-delete recycle bin. When enabled, files that a sync would delete or
 # overwrite, and items deleted from the Storage tab, are moved into this
@@ -183,6 +203,20 @@ EMPTY_DIR_FLAGS = ("--create-empty-src-dirs", S3_MARKER_FLAG)
 # and the folder stays behind as a ghost. Delete/move commands take the
 # marker flag alone; --create-empty-src-dirs is a copy-side flag.
 S3_DELETE_FLAGS = (S3_MARKER_FLAG,)
+
+# v2.4: flags for every `rclone lsjson` that feeds the Storage browser.
+# On S3 the original modification time and the MIME type are NOT part of a
+# bucket listing - they live in per-object metadata, so plain `lsjson` issues
+# one HEAD request PER OBJECT to fill them in. A folder of 8,400 images took
+# 4.5 minutes to list that way (measured against Pawsey), which blew through
+# the browser's 2-minute limit: the folder then showed up EMPTY with a
+# "Failed to list … Command timed out" error, i.e. "the files are not there".
+# With these two flags the same folder lists in 2 seconds (10 requests).
+#   --use-server-modtime  show the object's upload time instead of the file's
+#                         original mtime (no HEAD needed; the browser only
+#                         displays it, nothing compares it)
+#   --no-mimetype         the browser never shows the MIME type anyway
+FAST_LIST_FLAGS = ("--no-mimetype", "--use-server-modtime")
 
 # Default app config (merged with on-disk config on load)
 DEFAULT_CONFIG = {
@@ -331,12 +365,23 @@ def run_rclone_capture(args: list[str], timeout: int = 60) -> tuple[int, str]:
             timeout=timeout,
             creationflags=(subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0),
         )
-        return result.returncode, (result.stdout or "") + (result.stderr or "")
+        out = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            _diag(f"rclone rc={result.returncode}: "
+                  f"{' '.join(str(a) for a in args[:3])} | "
+                  f"{out.strip()[-600:]}")
+        return result.returncode, out
     except FileNotFoundError:
+        _diag(f"rclone NOT FOUND at {RCLONE_EXE!r} for: "
+              f"{' '.join(str(a) for a in args[:3])}")
         return 127, "rclone executable not found"
     except subprocess.TimeoutExpired:
+        _diag(f"rclone TIMEOUT after {timeout}s: "
+              f"{' '.join(str(a) for a in args[:3])}")
         return 124, "Command timed out"
     except Exception as e:
+        _diag(f"rclone call error: {e!r} for: "
+              f"{' '.join(str(a) for a in args[:3])}")
         return 1, f"Error: {e}"
 
 
@@ -1071,6 +1116,23 @@ class PawseyApp:
         # the next launch is instant.
         self._resolve_rclone_executable(prompt_if_missing=True)
 
+        # v2.3.1: uncaught exceptions in Tk callbacks and worker threads
+        # used to disappear (no console). Log them and tell the user.
+        self._tk_error_dialogs = 0
+        root.report_callback_exception = self._on_uncaught_exception
+        threading.excepthook = lambda a: _diag(
+            "thread crash: " + "".join(traceback.format_exception(
+                a.exc_type, a.exc_value, a.exc_traceback)))
+        try:
+            who = getpass.getuser()
+        except Exception:
+            who = "?"
+        ver_rc, ver_out = run_rclone_capture(["version"], timeout=20)
+        _diag(f"=== start {APP_NAME} v{APP_VERSION} user={who} "
+              f"exe={sys.executable} rclone={RCLONE_EXE!r} "
+              f"({(ver_out.splitlines() or ['?'])[0].strip() if ver_rc == 0 else 'version check failed'}) "
+              f"config={CONFIG_FILE}")
+
         root.title(f"{APP_NAME} v{APP_VERSION}")
         root.geometry("1120x800")
         root.minsize(940, 660)
@@ -1086,6 +1148,23 @@ class PawseyApp:
         root.after(120, self._drain_bg_queue)
         # Reconcile detached project->project copy jobs once the UI is up
         root.after(500, self._reconcile_project_copies)
+
+    def _on_uncaught_exception(self, exc_type, exc_value, tb) -> None:
+        """Tk callback crashed. Log the traceback and show it (first few)."""
+        text = "".join(traceback.format_exception(exc_type, exc_value, tb))
+        _diag("UI callback crash:\n" + text)
+        self._tk_error_dialogs += 1
+        if self._tk_error_dialogs <= 3:
+            try:
+                messagebox.showerror(
+                    APP_NAME,
+                    "An internal error occurred. The operation did not "
+                    "complete.\n\n"
+                    f"{exc_type.__name__}: {exc_value}\n\n"
+                    f"Details were written to:\n{DIAG_LOG}\n"
+                    "Please send that file to the app maintainer.")
+            except Exception:
+                pass
 
     # ----------------------------------------------------- rclone discovery
     def _resolve_rclone_executable(self, prompt_if_missing: bool = True) -> bool:
@@ -1980,16 +2059,27 @@ class PawseyApp:
 
     @staticmethod
     def _ensure_remote_path(dest: str) -> None:
-        """Make sure the destination prefix exists on Pawsey.
+        """Make sure the destination folder exists on Pawsey (v2.3: used by
+        every folder copy/move, not just two-way sync).
 
-        Two-way sync refuses to start unless BOTH sides already exist: if the
-        Pawsey prefix has no objects under it yet (a brand-new destination
-        folder) rclone reports 'error reading source root directory: directory
-        not found', raises a Bisync critical error and aborts - which reads as
-        a broken sync rather than "the folder isn't there yet".
+        rclone's --create-empty-src-dirs replicates the empty folders INSIDE
+        a source folder, but never the source folder itself: `rclone copy
+        <empty folder> pawsey:bucket/x` reports "There was nothing to
+        transfer" and writes no marker, so uploading, pasting, moving or
+        syncing a folder that is itself empty left no trace on Pawsey and
+        nothing to see on the Storage tab. A move of such a folder was worse:
+        rclone moved nothing, the app then cleared the old marker, and the
+        folder simply vanished. Creating the destination folder first closes
+        that gap for every one of those paths.
 
-        One idempotent API call fixes it. It writes only the zero-byte folder
-        marker, never any data, and does nothing if the prefix already exists.
+        Two-way sync additionally refuses to start unless BOTH sides already
+        exist: if the Pawsey prefix has no objects under it yet rclone reports
+        'error reading source root directory: directory not found', raises a
+        Bisync critical error and aborts.
+
+        One idempotent API call fixes both. It writes only the zero-byte
+        folder marker, never any data, and does nothing if the prefix already
+        exists.
         """
         if not dest:
             return
@@ -2372,8 +2462,13 @@ class PawseyApp:
         self._change_details = []
         self._rename_sources = set()
         # Two-way sync will not start against a Pawsey prefix that doesn't
-        # exist yet - create it first (folder marker only, no data).
-        if actual_mode == "bisync":
+        # exist yet - create it first (folder marker only, no data). Copy and
+        # mirror get the same on a real run: rclone never creates the source
+        # ROOT at the destination, so a source folder that is itself empty
+        # would otherwise leave nothing on Pawsey (see _ensure_remote_path).
+        # Skipped for a preview so a dry-run still writes nothing at all.
+        dry = bool(self.dry_run.get()) if hasattr(self, "dry_run") else False
+        if actual_mode == "bisync" or not dry:
             self._ensure_remote_path(dest)
         cmd = self._build_rclone_cmd(actual_mode, src, dest,
                                      bisync_resync=bisync_resync)
@@ -2686,7 +2781,11 @@ class PawseyApp:
         # Empty-folder operations (only logged once --create-empty-src-dirs is
         # in play, which it now always is). These are the changes that used to
         # be invisible: a folder added or removed with no files in it.
+        # rclone's actual wording for a real run is "<folder>: Making
+        # directory" (the preview says "Skipped make directory"); without
+        # "making directory" here every real run reported "folders: 0".
         if ("created directory" in low or "made directory" in low
+                or "making directory" in low
                 or "removing directory" in low or "removed directory" in low
                 or "creating directory" in low):
             record("dirs", after)
@@ -3345,6 +3444,8 @@ class PawseyApp:
                     cb(result, err)
                 except Exception as e:
                     print(f"Background callback error: {e}", file=sys.stderr)
+                    _diag("background callback crash:\n"
+                          + traceback.format_exc())
         except queue.Empty:
             pass
         self.root.after(80, self._drain_bg_queue)
@@ -3370,17 +3471,34 @@ class PawseyApp:
         messagebox.showerror(APP_NAME, "Incorrect password. No change was made.")
         return False
 
-    def _bg_stream(self, args, on_line, on_done, timeout: int = 86400) -> None:
+    def _bg_stream(self, args, on_line, on_done, timeout: int = 86400,
+                   pre: Optional[list] = None) -> None:
         """Run rclone in a daemon thread, streaming each output line to
         `on_line(line)` on the Tk main thread, then delivering the final
         (returncode, tail_output) to `on_done(result, err)` on the main thread.
 
         Used by the Storage tab so copy / move / delete show live progress
         instead of appearing to hang until the whole operation finishes.
+
+        `pre` is an optional list of short rclone arg-lists to run (and log)
+        first, in the same worker thread - e.g. the `mkdir` that makes sure a
+        folder destination exists before a copy/move that would otherwise
+        skip an empty folder. Their exit codes do not affect the result.
         """
         def runner():
             tail: list[str] = []
             try:
+                for pre_args in (pre or []):
+                    try:
+                        _rc, pre_out = run_rclone_capture(
+                            list(pre_args), timeout=600)
+                    except Exception as e:      # never block the main op
+                        pre_out = str(e)
+                    for pl in pre_out.splitlines():
+                        if pl.strip():
+                            self._bg_queue.put(
+                                (lambda _r, _e, l=pl + "\n": on_line(l),
+                                 None, None))
                 proc = subprocess.Popen(
                     [RCLONE_EXE, *args], **_subprocess_kwargs())
                 assert proc.stdout is not None
@@ -3736,8 +3854,11 @@ class PawseyApp:
         self.status_var.set(f"Loading {path}…")
 
         def work():
+            # FAST_LIST_FLAGS: without them a big folder needs one HEAD per
+            # object and used to time out, leaving the folder looking empty.
             rc, out = run_rclone_capture(
-                ["lsjson", f"{remote}:{path}"], timeout=120)
+                ["lsjson", f"{remote}:{path}", *FAST_LIST_FLAGS],
+                timeout=900)
             if rc != 0:
                 raise RuntimeError(out)
             return json.loads(out or "[]")
@@ -3966,6 +4087,10 @@ class PawseyApp:
         self.status_var.set(f"Uploading folder {src_name}…")
 
         def work():
+            # The folder itself first: rclone replicates empty folders INSIDE
+            # the source but never the source root, so an empty folder would
+            # otherwise upload as nothing at all (see _ensure_remote_path).
+            self._ensure_remote_path(full_dest)
             return run_rclone_capture(
                 ["copy", src, full_dest,
                  "--s3-no-check-bucket", "--s3-disable-checksum",
@@ -4019,7 +4144,6 @@ class PawseyApp:
             return
 
         new_full_path = f"{parent_path}/{name}"
-        marker = f"{remote}:{new_full_path}/.keep"
 
         self._append_log({
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -4030,10 +4154,13 @@ class PawseyApp:
         })
 
         def work():
-            # On S3 there are no real folders, so create a placeholder
-            # `.keep` object to make the folder visible in listings.
+            # On S3 there are no real folders. Write the same zero-byte
+            # "<folder>/" marker every transfer uses (v2.3; previously a
+            # visible `.keep` file), so the new folder shows up as an empty
+            # folder and not as a folder holding a stray file.
             return run_rclone_capture(
-                ["touch", marker, "--s3-no-check-bucket"], timeout=60)
+                ["mkdir", f"{remote}:{new_full_path}",
+                 "--s3-no-check-bucket", S3_MARKER_FLAG], timeout=60)
 
         def done(result, err):
             if err:
@@ -4516,6 +4643,12 @@ class PawseyApp:
             args = ["move", src_full, dest_full, "--delete-empty-src-dirs",
                     *EMPTY_DIR_FLAGS]
         args += ["--s3-no-check-bucket", "--stats=1s", "--stats-one-line", "-v"]
+        # An EMPTY folder has nothing for `move` to move: rclone would report
+        # "nothing to transfer", the marker clean-up below would then remove
+        # the old folder, and the folder would vanish. Create the destination
+        # first so the folder survives the move (see _ensure_remote_path).
+        pre = ([] if type_ == "file" else
+               [["mkdir", dest_full, "--s3-no-check-bucket", S3_MARKER_FLAG]])
 
         def on_line(line: str):
             line = line.rstrip("\n")
@@ -4569,7 +4702,7 @@ class PawseyApp:
                 messagebox.showerror(APP_NAME, f"Rename/move failed on Pawsey:\n{out}{extra}")
                 self.status_var.set("Rename/move failed on Pawsey.")
 
-        self._bg_stream(args, on_line, done, timeout=86400)
+        self._bg_stream(args, on_line, done, timeout=86400, pre=pre)
 
     # ===== Copy / Cut / Paste (Windows-style, server-side on Pawsey) ======
 
@@ -4725,6 +4858,11 @@ class PawseyApp:
         # can parse into a percentage for the progress bar.
         args += ["--s3-no-check-bucket", "--stats=1s", "--stats-one-line",
                  "-v"]
+        # Folder: create the destination first, otherwise an EMPTY folder is
+        # "nothing to transfer" for rclone and is silently dropped (and, for a
+        # cut, removed at the source too). See _ensure_remote_path.
+        pre = ([] if type_ == "file" else
+               [["mkdir", dest_full, "--s3-no-check-bucket", S3_MARKER_FLAG]])
 
         verb = st["verb"]
         self._storage_progress_set(
@@ -4770,7 +4908,7 @@ class PawseyApp:
                 f"{verb}ing… {st['done'] + st['failed']}/{total}")
             self._process_next_paste()
 
-        self._bg_stream(args, on_line, on_done, timeout=86400)
+        self._bg_stream(args, on_line, on_done, timeout=86400, pre=pre)
 
     def _finish_paste(self) -> None:
         st = self._paste_state
@@ -5078,6 +5216,11 @@ class PawseyApp:
         def work():
             results = []
             for it, args in zip(entry["items"], cmds):
+                if it[1] != "file":
+                    # Empty folders need their root created explicitly
+                    # (rclone copies what is inside a folder, never the
+                    # folder itself). See _ensure_remote_path.
+                    self._ensure_remote_path(args[2])
                 rc, out = run_rclone_capture(args, timeout=86400)
                 results.append((it[0], rc, out))
             return results
@@ -5138,6 +5281,13 @@ class PawseyApp:
             lines = ["@echo off", 'set "FAILED="',
                      f'> {q(log)} echo === project-copy {entry["id"]} ===']
             for args in cmds:
+                if args[0] == "copy":
+                    # Folder: make sure it exists even if it is empty
+                    # (rclone never creates the source root itself).
+                    mk = [RCLONE_EXE, "mkdir", args[2],
+                          "--s3-no-check-bucket", S3_MARKER_FLAG]
+                    lines.append(" ".join(q(t) for t in mk)
+                                 + f" >> {q(log)} 2>&1")
                 toks = [RCLONE_EXE] + args + prog
                 lines.append(" ".join(q(t) for t in toks) + f" >> {q(log)} 2>&1")
                 lines.append('if errorlevel 1 set "FAILED=1"')
@@ -5150,6 +5300,11 @@ class PawseyApp:
             lines = ["#!/bin/sh", "FAILED=0",
                      f'echo "=== project-copy {entry["id"]} ===" > {q(log)}']
             for args in cmds:
+                if args[0] == "copy":
+                    mk = [RCLONE_EXE, "mkdir", args[2],
+                          "--s3-no-check-bucket", S3_MARKER_FLAG]
+                    lines.append(" ".join(q(t) for t in mk)
+                                 + f" >> {q(log)} 2>&1 || true")
                 toks = [RCLONE_EXE] + args + prog
                 lines.append(" ".join(q(t) for t in toks)
                              + f" >> {q(log)} 2>&1 || FAILED=1")
@@ -5783,6 +5938,7 @@ class PawseyApp:
             # List files, skipping our own share pages and the recycle bin.
             rc, out = run_rclone_capture(
                 ["lsjson", src, "-R", "--files-only", "--no-modtime",
+                 "--no-mimetype",
                  "--exclude", "_shares/**",
                  "--exclude", f"{RECYCLE_PREFIX}/**"],
                 timeout=900)
@@ -6294,6 +6450,14 @@ function filt(q) {{
                    *EMPTY_DIR_FLAGS, "--transfers=4"]
 
         def work():
+            if type_ != "file":
+                # An empty Pawsey folder downloads as nothing unless the
+                # local folder itself is created (rclone only replicates
+                # the folders INSIDE the source, never the root).
+                try:
+                    Path(local).mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
             return run_rclone_capture(cmd, timeout=86400 * 2)
 
         def done(result, err):
@@ -6335,8 +6499,9 @@ function filt(q) {{
 
         def work():
             rc, out = run_rclone_capture(
-                ["lsjson", target, "--recursive", "--files-only"],
-                timeout=600)
+                ["lsjson", target, "--recursive", "--files-only",
+                 *FAST_LIST_FLAGS],
+                timeout=1800)
             if rc != 0:
                 raise RuntimeError(out)
             items = json.loads(out or "[]")
@@ -6435,7 +6600,8 @@ function filt(q) {{
                 # Inline load (synchronously for reveal correctness)
                 remote = self.storage_remote.get().strip()
                 rc, out = run_rclone_capture(
-                    ["lsjson", f"{remote}:{current}"], timeout=120)
+                    ["lsjson", f"{remote}:{current}", *FAST_LIST_FLAGS],
+                    timeout=900)
                 if rc == 0:
                     try:
                         items = json.loads(out or "[]")

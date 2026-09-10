@@ -87,8 +87,26 @@ open. rclone and the app's Storage browser both show those markers as ordinary
 folders, never as stray files, and folder deletes/moves pass the marker flag so
 no ghost folders are left behind.
 
+**The folder itself, not just what is inside it (v2.3).** rclone's
+`--create-empty-src-dirs` replicates the empty folders *inside* a source folder
+but never the source folder itself, so up to v2.2 a folder that was **itself
+empty** — a placeholder `Documents/` or `code/` uploaded, pasted or moved on its
+own — was "nothing to transfer" for rclone: it left no marker on Pawsey, showed
+nothing on the Storage tab, and a *move* of such a folder made it disappear
+outright (rclone moved nothing, then the old folder marker was cleared). Since
+v2.3 every folder operation creates the destination folder first (`rclone mkdir
+--s3-directory-markers`, one zero-byte marker, no data): Transfer-tab Copy /
+Mirror / Two-way sync, Storage-tab **Upload folder**, **Paste** (copy and cut),
+**Rename/move**, **Send to another project** and **Download** (the local folder
+is created). **New folder** now writes the same marker instead of a visible
+`.keep` file. A preview (dry-run) still writes nothing.
+
+Zero-byte **files** were never affected: rclone copies them like any other file
+and they show on the Storage tab with size 0 B.
+
 > **Already uploaded a dataset without its empty folders?** Just run the same
-> transfer again. Copy adds the missing folders and re-uploads no files.
+> transfer again. Copy adds the missing folders and re-uploads no files. For a
+> folder that is itself empty, upload it again with **Upload folder** (v2.3+).
 
 ### Sync options
 
@@ -186,6 +204,15 @@ On Linux, restrict permissions: `chmod 600 ~/.pawsey_uploader/config.json`
 
 ## Troubleshooting
 
+**A folder shows as empty / "Failed to list …: Command timed out" (fixed in v2.4):** older versions fetched per-object metadata while listing, so folders with thousands of files could not be listed within 2 minutes and appeared empty. Upgrade to v2.4.
+
+**Start here (v2.3.1+):** open `%USERPROFILE%\.pawsey_uploaderpp_errors.log`.
+It records each app start (Windows user, rclone path and version, config file),
+every rclone call that failed and why, and any internal error. Each Windows
+account has its own `.pawsey_uploader` folder, config and rclone remotes, so a
+colleague launching the same `.exe` on the same PC does **not** share your
+settings or your transfer history.
+
 * **`rclone executable not found`** — activate the conda env or install rclone.
 * **`403 UserSuspended`** — your Pawsey access keys are disabled. Contact
   `help@pawsey.org.au`; no app setting can fix this.
@@ -208,10 +235,16 @@ pawsey_uploader.py          # the app
 logo_data.py                # embedded DPIRD + APPN logos (base64 PNG); bundled automatically
 build_exe.bat               # one-click Windows build script — WARNING: wipes dist/
 build_linux.sh              # one-click Linux build script
-PDMA-v2.2.spec              # PyInstaller spec for the current release
-PDMA-v2.1.spec              # spec for the previous release
+PDMA-v2.4.spec              # PyInstaller spec for the current release
+PDMA-v2.3.1.spec            # spec for the previous release
+PDMA-v2.3.spec              # spec for an older release
+PDMA-v2.2.spec              # spec for an older release
+PDMA-v2.1.spec              # spec for an older release
 PawseyUploader.spec         # spec from the pre-PDMA naming
-dist/PDMA-v2.2.exe          # prebuilt Windows executable — the LATEST version
+dist/PDMA-v2.4.exe          # prebuilt Windows executable — the LATEST version
+dist/PDMA-v2.3.1.exe        # retained previous version
+dist/PDMA-v2.3.exe          # retained previous version
+dist/PDMA-v2.2.exe          # retained previous version
 dist/PDMA-v2.1.exe          # retained previous version
 dist/PDMA-v2.0.exe          # retained previous version
 dist/PawseyUploader.exe     # retained v1.9 (last build under the old name)
@@ -231,7 +264,10 @@ so you can confirm which one you launched.
 
 | File | Version | Notes |
 |---|---|---|
-| `dist/PDMA-v2.2.exe` | **v2.2 (latest)** | **Empty folders** now transfer in every mode and both directions; **change detection fixed** — a preview no longer reports "no changes" when it has thousands of files to move; verify compares folders too and no longer passes same-size/different-content files; two-way baseline recovery |
+| `dist/PDMA-v2.4.exe` | **v2.4 (latest)** | **Storage tab lists big folders in seconds instead of timing out.** Plain `rclone lsjson` does one HEAD request per object on S3 to fetch the original mtime and MIME type; a folder of 8,400 images took 4.5 min, exceeded the browser's 2-min limit and was shown as *empty* ("Failed to list … Command timed out"). Listings now use `--use-server-modtime --no-mimetype` (2 s for the same folder; the Modified column shows the upload time) and the limit is 15 min |
+| `dist/PDMA-v2.3.1.exe` | v2.3.1 | **Diagnostics log** `~/.pawsey_uploader/app_errors.log`: every failing rclone call, every internal error (now also shown in a dialog instead of vanishing), and each app start with user, rclone path and version — send this file when reporting a problem |
+| `dist/PDMA-v2.3.exe` | v2.3 | **Empty folders that are themselves empty** (an empty `Documents/` uploaded, pasted, moved, sent or synced on its own) now exist on Pawsey and show on the Storage tab — previously rclone saw "nothing to transfer" and wrote no marker; a move of such a folder no longer makes it vanish; folder downloads create the local folder; **New folder** writes a folder marker instead of a `.keep` file; real runs now count folder creations ("Making directory") in the change summary |
+| `dist/PDMA-v2.2.exe` | v2.2 | **Empty folders** now transfer in every mode and both directions; **change detection fixed** — a preview no longer reports "no changes" when it has thousands of files to move; verify compares folders too and no longer passes same-size/different-content files; two-way baseline recovery |
 | `dist/PDMA-v2.1.exe` | v2.1 | Preview-by-default, password-gated destructive modes, verify-both-sides, adjustable delete cap |
 | `dist/PDMA-v2.0.exe` | v2.0 | Renamed to PDMA; **permanent public links** for publishing datasets (temporary links retained) |
 | `dist/PawseyUploader.exe` | v1.9 | Background (survives app close) + resumable "Send to another project" |
@@ -241,7 +277,7 @@ so you can confirm which one you launched.
 | `dist/PawseyUploader-v1.4.exe` | v1.4 | Two-way sync, recycle bin, unattended operation |
 
 > Note: `PawseyUploader.exe` (no version suffix) is **not** the newest build —
-> it is the last release made under the old name (v1.9). Use `PDMA-v2.2.exe`.
+> it is the last release made under the old name (v1.9). Use `PDMA-v2.4.exe`.
 
 ### Rebuilding the `.exe` yourself
 
@@ -251,7 +287,7 @@ so you can confirm which one you launched.
 Build a single target from its spec instead, which touches only that one file:
 
 ```bat
-python -m PyInstaller PDMA-v2.2.spec --noconfirm --distpath dist
+python -m PyInstaller PDMA-v2.4.spec --noconfirm --distpath dist
 ```
 
 Use a **python.org / system Python**, not a conda env: PyInstaller in a conda
