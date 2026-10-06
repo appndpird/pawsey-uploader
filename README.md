@@ -168,6 +168,7 @@ The app is designed to be left running for days:
 
 | Feature | Where to find it |
 |---|---|
+| **Rename / Match** — folders renamed locally after upload are matched to their Pawsey copy by *content* (file names + sizes, MD5 spot-checks) and renamed server-side instead of re-uploaded; also spots partial duplicate copies | Rename / Match tab |
 | **Multiple Pawsey projects** — save several projects (each its own keys), mark one active, switch any time | Settings tab → Pawsey projects |
 | **Copy / Cut / Paste** files & folders on Pawsey (Windows-style; server-side move/copy, no re-upload) | Storage tab |
 | **Send to another project** — copy selected buckets/folders/files into a *different* Pawsey project's bucket (copy-only, nothing deleted) | Storage tab → "📤 Send to another project…" |
@@ -264,7 +265,8 @@ so you can confirm which one you launched.
 
 | File | Version | Notes |
 |---|---|---|
-| `dist/PDMA-v2.4.exe` | **v2.4 (latest)** | **Storage tab lists big folders in seconds instead of timing out.** Plain `rclone lsjson` does one HEAD request per object on S3 to fetch the original mtime and MIME type; a folder of 8,400 images took 4.5 min, exceeded the browser's 2-min limit and was shown as *empty* ("Failed to list … Command timed out"). Listings now use `--use-server-modtime --no-mimetype` (2 s for the same folder; the Modified column shows the upload time) and the limit is 15 min |
+| `dist/PDMA-v2.5.exe` | **v2.5 (latest)** | **Rename / Match tab.** A project/site/date folder renamed on the PC after upload no longer re-uploads: the tab lists both sides once, pairs folders by contents (file names + sizes; MD5 spot-checks against Pawsey's stored hashes), and applies the renames as server-side moves on Pawsey (or renames the local folders to match). Flags partial duplicate copies left by an interrupted sync, lists folders only on one side, deletions honour the recycle-bin setting, everything is logged with a note |
+| `dist/PDMA-v2.4.exe` | v2.4 | **Storage tab lists big folders in seconds instead of timing out.** Plain `rclone lsjson` does one HEAD request per object on S3 to fetch the original mtime and MIME type; a folder of 8,400 images took 4.5 min, exceeded the browser's 2-min limit and was shown as *empty* ("Failed to list … Command timed out"). Listings now use `--use-server-modtime --no-mimetype` (2 s for the same folder; the Modified column shows the upload time) and the limit is 15 min |
 | `dist/PDMA-v2.3.1.exe` | v2.3.1 | **Diagnostics log** `~/.pawsey_uploader/app_errors.log`: every failing rclone call, every internal error (now also shown in a dialog instead of vanishing), and each app start with user, rclone path and version — send this file when reporting a problem |
 | `dist/PDMA-v2.3.exe` | v2.3 | **Empty folders that are themselves empty** (an empty `Documents/` uploaded, pasted, moved, sent or synced on its own) now exist on Pawsey and show on the Storage tab — previously rclone saw "nothing to transfer" and wrote no marker; a move of such a folder no longer makes it vanish; folder downloads create the local folder; **New folder** writes a folder marker instead of a `.keep` file; real runs now count folder creations ("Making directory") in the change summary |
 | `dist/PDMA-v2.2.exe` | v2.2 | **Empty folders** now transfer in every mode and both directions; **change detection fixed** — a preview no longer reports "no changes" when it has thousands of files to move; verify compares folders too and no longer passes same-size/different-content files; two-way baseline recovery |
@@ -277,7 +279,7 @@ so you can confirm which one you launched.
 | `dist/PawseyUploader-v1.4.exe` | v1.4 | Two-way sync, recycle bin, unattended operation |
 
 > Note: `PawseyUploader.exe` (no version suffix) is **not** the newest build —
-> it is the last release made under the old name (v1.9). Use `PDMA-v2.4.exe`.
+> it is the last release made under the old name (v1.9). Use `PDMA-v2.5.exe`.
 
 ### Rebuilding the `.exe` yourself
 
@@ -287,7 +289,7 @@ so you can confirm which one you launched.
 Build a single target from its spec instead, which touches only that one file:
 
 ```bat
-python -m PyInstaller PDMA-v2.4.spec --noconfirm --distpath dist
+python -m PyInstaller PDMA-v2.5.spec --noconfirm --distpath dist
 ```
 
 Use a **python.org / system Python**, not a conda env: PyInstaller in a conda
@@ -335,6 +337,36 @@ key bucket access via a policy (which also enables fast server-side copies).
 
 Existing single-remote setups are migrated into this panel automatically on
 first launch — nothing to redo.
+
+## Rename / Match — fixing renamed folders without re-uploading  *(new in v2.5)*
+
+Symptom: you renamed `2026_WonganHill_F` to `2026WonganHill_F` (or `2026-07-08`
+to `20260708`) on the PC after it was uploaded. The next Copy puts a second
+full copy on Pawsey; the next Mirror deletes the old one and uploads it all
+again. Either way ~50 GB of identical raw data moves for a name change.
+
+The **Rename / Match** tab compares a local project folder with its Pawsey
+counterpart (e.g. `F:\...6_AcidTolerance_I_DPIRD` ⟷
+`pawsey:dpird-appn-2026/2026_AcidTolerance_I_DPIRD`) and pairs folders by
+**what is inside them**: same file names with the same sizes = same folder,
+whatever it is called. If the *project* folder itself was renamed, **Find on
+Pawsey by content…** scans the bucket and picks the folder holding the same
+files. A few files per pair are MD5-checked against the hash
+Pawsey stores for each object. The result is a table of actions you tick:
+
+| Row | Meaning | Default |
+|---|---|---|
+| Rename on Pawsey / Rename locally | same data, different name | ticked |
+| Remove partial copy on Pawsey | a copy under the *new* name whose files are all in the real folder (interrupted sync) | unticked |
+| Delete from Pawsey? | folder with no counterpart locally | unticked |
+| Only on this PC | new data — your next Transfer uploads it | info only |
+| Conflict | two copies that differ — sort out by hand | info only |
+
+Renames on Pawsey are server-side moves (seconds per folder, no transfer).
+Deletions obey the recycle-bin setting on the Transfer tab. Each action is
+logged with your note. Afterwards, scan again, then run the normal Transfer
+for the genuinely new files; a two-way-sync pair needs its baseline rebuilt
+once.
 
 ## Sharing & publishing links — how it works
 

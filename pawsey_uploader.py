@@ -26,6 +26,7 @@ Run with:  python pawsey_uploader.py
 from __future__ import annotations
 
 import base64
+import difflib
 import hashlib
 import hmac
 import json
@@ -45,6 +46,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import zipfile
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -64,7 +66,7 @@ except Exception:  # pragma: no cover - logos are cosmetic
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Pawsey Data Management App (PDMA)"
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 APP_TAGLINE = "DPIRD · APPN  |  Pawsey Acacia object storage manager"
 
 # ---------------------------------------------------------------------------
@@ -778,6 +780,431 @@ def s3_url_is_public(url: str, timeout: int = 20) -> bool:
 # ---------------------------------------------------------------------------
 # Config manager
 # ---------------------------------------------------------------------------
+# v2.5: Rename / Match tab - content-based folder matching ("reconcile")
+# ---------------------------------------------------------------------------
+# Problem this solves: a project folder is renamed (or a date folder is
+# written a different way) on the local machine AFTER it was uploaded.
+# Every sync mode then sees a brand-new folder on one side and a missing one
+# on the other, and re-uploads tens of gigabytes that are already on Pawsey
+# under the old name (or, for Copy mode, leaves a second copy behind).
+#
+# The matcher below pairs folders by WHAT IS INSIDE THEM, not by their name:
+# two folders are "the same" when the files beneath them match by file name
+# and size (every DJI image, VNIR band, RINEX file, ... has a unique name and
+# an exact byte size, so the combination is highly specific). Matched folders
+# whose names differ become rename proposals that the user can apply as
+# server-side moves on Pawsey (no data transfer) or as local renames.
+# Optionally, a few files per matched pair are MD5-checked against the
+# object's hash on Pawsey to confirm the match is genuine.
+
+RECONCILE_MATCH_THRESHOLD = 0.80   # share of the smaller side's files that
+                                   # must also be in the bigger side
+RECONCILE_VERIFY_SAMPLES = 3       # files MD5-checked per matched folder
+RECONCILE_MAX_FILE_HASH_BYTES = 2 * 1024 ** 3   # cap on local hashing for
+                                                # renamed-FILE detection
+
+
+def _run_rclone_split(args: list[str], timeout: int = 3600):
+    """Like run_rclone_capture but keeps stdout and stderr apart, so JSON
+    output can be parsed even when rclone prints NOTICE lines."""
+    try:
+        result = subprocess.run(
+            [RCLONE_EXE, *args], capture_output=True, text=True,
+            timeout=timeout, encoding="utf-8", errors="replace",
+            creationflags=(subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0))
+        if result.returncode != 0:
+            _diag(f"rclone rc={result.returncode}: "
+                  f"{' '.join(str(a) for a in args[:3])} | "
+                  f"{(result.stderr or '').strip()[-600:]}")
+        return result.returncode, result.stdout or "", result.stderr or ""
+    except FileNotFoundError:
+        return 127, "", "rclone executable not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", "Command timed out"
+    except Exception as e:
+        return 1, "", f"Error: {e}"
+
+
+class _TreeNode:
+    """One folder of a local or Pawsey tree used by the matcher."""
+    __slots__ = ("name", "path", "parent", "files", "dirs", "sig",
+                 "nfiles", "nbytes")
+
+    def __init__(self, name: str, path: str, parent=None) -> None:
+        self.name = name
+        self.path = path            # relative, '/'-separated, '' for root
+        self.parent = parent
+        self.files: dict = {}       # file name -> (size, md5 or '')
+        self.dirs: dict = {}        # folder name -> _TreeNode
+        self.sig = None             # Counter of (file name, size) below here
+        self.nfiles = 0
+        self.nbytes = 0
+
+    def child_dir(self, name: str):
+        n = self.dirs.get(name)
+        if n is None:
+            n = _TreeNode(name, f"{self.path}/{name}" if self.path else name, self)
+            self.dirs[name] = n
+        return n
+
+    def ensure_path(self, relpath: str):
+        node = self
+        for part in relpath.split("/"):
+            if part:
+                node = node.child_dir(part)
+        return node
+
+    def finalize(self) -> None:
+        sig = Counter((fn, sz) for fn, (sz, _h) in self.files.items())
+        nfiles = len(self.files)
+        nbytes = sum(sz for sz, _h in self.files.values())
+        for d in self.dirs.values():
+            d.finalize()
+            sig.update(d.sig)
+            nfiles += d.nfiles
+            nbytes += d.nbytes
+        self.sig, self.nfiles, self.nbytes = sig, nfiles, nbytes
+
+    def walk_files(self):
+        """Yield (relpath, size, md5) for every file below this folder."""
+        for fn, (sz, h) in self.files.items():
+            yield (f"{self.path}/{fn}" if self.path else fn), sz, h
+        for d in self.dirs.values():
+            yield from d.walk_files()
+
+    @property
+    def depth(self) -> int:
+        return self.path.count("/") + 1 if self.path else 0
+
+
+def _build_local_tree(root: str) -> _TreeNode:
+    rootp = Path(root)
+    node = _TreeNode(rootp.name, "")
+    for dirpath, dirnames, filenames in os.walk(rootp):
+        rel = os.path.relpath(dirpath, rootp).replace(os.sep, "/")
+        cur = node if rel == "." else node.ensure_path(rel)
+        for d in dirnames:          # keeps empty folders visible
+            cur.child_dir(d)
+        for f in filenames:
+            try:
+                sz = os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                continue
+            cur.files[f] = (sz, "")
+    node.finalize()
+    return node
+
+
+def _build_remote_tree(location: str) -> tuple:
+    """List a Pawsey prefix recursively. Returns (node, error_text)."""
+    name = location.partition(":")[2].rstrip("/").split("/")[-1]
+    node = _TreeNode(name, "")
+    # --hash: the object's MD5 comes back in the same listing (ETag), no
+    # extra request per object. FAST_LIST_FLAGS: no HEAD per object.
+    rc, out, err = _run_rclone_split(
+        ["lsjson", location, "-R", "--files-only", "--hash",
+         *FAST_LIST_FLAGS, *_app_prefix_excludes()], timeout=7200)
+    if rc != 0:
+        return node, (err or out).strip() or f"rclone exit code {rc}"
+    try:
+        items = json.loads(out or "[]")
+    except json.JSONDecodeError as e:
+        return node, f"Could not parse listing: {e}"
+    for it in items:
+        p = it.get("Path") or ""
+        if not p or it.get("IsDir"):
+            continue
+        d, _, fn = p.rpartition("/")
+        cur = node.ensure_path(d) if d else node
+        md5 = ((it.get("Hashes") or {}).get("md5") or "").lower()
+        cur.files[fn] = (int(it.get("Size") or 0), md5)
+    # Empty folders exist only as marker objects; a second cheap listing
+    # brings them in so they can be renamed too.
+    rc2, out2, _err2 = _run_rclone_split(
+        ["lsf", location, "-R", "--dirs-only", S3_MARKER_FLAG,
+         *_app_prefix_excludes()], timeout=7200)
+    if rc2 == 0:
+        for ln in out2.splitlines():
+            ln = ln.strip().rstrip("/")
+            if ln:
+                node.ensure_path(ln)
+    node.finalize()
+    return node, ""
+
+
+def _containment(a: Counter, b: Counter) -> tuple:
+    """(files in common, share of the smaller side that is common, Jaccard)."""
+    if not a or not b:
+        return 0, 0.0, 0.0
+    common = sum((a & b).values())
+    small = min(sum(a.values()), sum(b.values()))
+    union = sum((a | b).values())
+    return common, (common / small if small else 0.0), (common / union if union else 0.0)
+
+
+def _name_similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def _md5_of_file(path: str, chunk: int = 4 * 1024 * 1024) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+def _reconcile_trees(local: _TreeNode, remote: _TreeNode,
+                     threshold: float = RECONCILE_MATCH_THRESHOLD) -> dict:
+    """Pair the two trees top-down and return proposed actions + statistics.
+
+    Each op is a dict with at least: kind, local (rel path or ''), remote
+    (rel path or ''), nfiles, nbytes, match (0-1), depth, checked, safe.
+    kinds:
+      rename_dir   - same folder, different name on the two sides
+      rename_file  - same file (size + MD5), different name
+      remove_dup   - a partial second copy on Pawsey (e.g. an interrupted
+                     sync under the NEW name) whose files are all present in
+                     the real folder; removing it lets the real folder take
+                     that name
+      conflict     - a second copy that is NOT a clean subset: left alone
+      only_remote_dir / only_local_dir - no counterpart found at all
+    """
+    ops: list = []
+    file_cands: list = []
+    stats = {"pairs": 0, "same_files": 0, "differ_files": 0,
+             "only_local_files": 0, "only_local_bytes": 0,
+             "only_remote_files": 0, "only_remote_bytes": 0}
+
+    def rename_op(ln, rn, how, match, jac):
+        return {"kind": "rename_dir", "local": ln.path, "remote": rn.path,
+                "local_name": ln.name, "remote_name": rn.name,
+                "nfiles": max(ln.nfiles, rn.nfiles), "nbytes": max(ln.nbytes, rn.nbytes),
+                "common": sum((ln.sig & rn.sig).values()),
+                "match": match, "jaccard": jac, "how": how,
+                "depth": max(ln.depth, rn.depth), "checked": True,
+                "safe": True, "lnode": ln, "rnode": rn, "verify": ""}
+
+    def level(L, R):
+        stats["pairs"] += 1
+        lk, rk = dict(L.dirs), dict(R.dirs)
+        paired = []                             # (lnode, rnode, how)
+        # 1. identical names pair immediately
+        for name in list(lk):
+            if name in rk:
+                paired.append((lk.pop(name), rk.pop(name), "name"))
+        # 2. the rest pair by content (best containment first)
+        cands = []
+        for ln in lk.values():
+            for rn in rk.values():
+                common, cont, jac = _containment(ln.sig, rn.sig)
+                if common and cont >= threshold:
+                    cands.append((cont, jac, _name_similarity(ln.name, rn.name),
+                                  ln.name, rn.name))
+                elif (not ln.sig and not rn.sig and not ln.dirs and not rn.dirs
+                      and ln.name.lower() == rn.name.lower()):
+                    # two empty folders differing only in case
+                    cands.append((1.0, 1.0, 1.0, ln.name, rn.name))
+        cands.sort(reverse=True)
+        for cont, jac, _s, lname, rname in cands:
+            if lname in lk and rname in rk:
+                ln, rn = lk.pop(lname), rk.pop(rname)
+                paired.append((ln, rn, "content"))
+                ops.append(rename_op(ln, rn, "content", cont, jac))
+        # 3. a leftover Pawsey folder that is a BETTER content match for a
+        #    local folder than its same-name partner: the same-name partner is
+        #    a partial duplicate (typically an interrupted sync under the new
+        #    name). Prefer the real folder; propose removing the partial copy.
+        for rname, rn in list(rk.items()):
+            best = None
+            for ln, rn0, how in paired:
+                if how != "name":
+                    continue
+                common, cont, _jac = _containment(ln.sig, rn.sig)
+                common0, _c0, _j0 = _containment(ln.sig, rn0.sig)
+                if common and cont >= threshold and common > common0:
+                    if best is None or common > best[0]:
+                        best = (common, cont, ln, rn0)
+            if best is None:
+                continue
+            common, cont, ln, rn0 = best
+            rk.pop(rname)
+            paired = [(a, b, h) for (a, b, h) in paired if b is not rn0]
+            paired.append((ln, rn, "content"))
+            subset = not (rn0.sig - rn.sig)      # every file of the dup is in rn
+            ops.append({
+                "kind": "remove_dup" if subset else "conflict",
+                "local": "", "remote": rn0.path, "local_name": "",
+                "remote_name": rn0.name, "nfiles": rn0.nfiles,
+                "nbytes": rn0.nbytes, "common": sum((rn0.sig & rn.sig).values()),
+                "match": 1.0 if subset else 0.0, "jaccard": 0.0,
+                "how": "duplicate", "depth": rn0.depth,
+                "checked": False, "safe": subset, "lnode": None, "rnode": rn0,
+                "verify": "",
+                "note": (f"partial copy of '{rn.path}' ({rn0.nfiles} files, "
+                         f"all also in the real folder)" if subset else
+                         f"second copy of '{rn.path}' with "
+                         f"{sum((rn0.sig - rn.sig).values())} file(s) not in it "
+                         f"- merge or delete by hand")})
+            common_lr, cont_lr, jac_lr = _containment(ln.sig, rn.sig)
+            ops.append(rename_op(ln, rn, "content", cont_lr, jac_lr))
+        # 3b. mirror case: a leftover LOCAL folder that better matches a
+        #     same-name-paired Pawsey folder (local holds the partial copy).
+        for lname, ln in list(lk.items()):
+            best = None
+            for ln0, rn, how in paired:
+                if how != "name":
+                    continue
+                common, cont, _jac = _containment(ln.sig, rn.sig)
+                common0, _c0, _j0 = _containment(ln0.sig, rn.sig)
+                if common and cont >= threshold and common > common0:
+                    if best is None or common > best[0]:
+                        best = (common, cont, ln0, rn)
+            if best is None:
+                continue
+            common, cont, ln0, rn = best
+            lk.pop(lname)
+            paired = [(a, b, h) for (a, b, h) in paired if a is not ln0]
+            paired.append((ln, rn, "content"))
+            ops.append({
+                "kind": "conflict", "local": ln0.path, "remote": "",
+                "local_name": ln0.name, "remote_name": "",
+                "nfiles": ln0.nfiles, "nbytes": ln0.nbytes, "common": 0,
+                "match": 0.0, "jaccard": 0.0, "how": "duplicate",
+                "depth": ln0.depth, "checked": False, "safe": False,
+                "lnode": ln0, "rnode": None, "verify": "",
+                "note": (f"local folder is a partial second copy of "
+                         f"'{ln.path}' - tidy it up locally by hand")})
+            common_lr, cont_lr, jac_lr = _containment(ln.sig, rn.sig)
+            ops.append(rename_op(ln, rn, "content", cont_lr, jac_lr))
+        # 4. whatever is left has no counterpart
+        for ln in lk.values():
+            ops.append({"kind": "only_local_dir", "local": ln.path, "remote": "",
+                        "local_name": ln.name, "remote_name": "",
+                        "nfiles": ln.nfiles, "nbytes": ln.nbytes, "common": 0,
+                        "match": 0.0, "jaccard": 0.0, "how": "", "depth": ln.depth,
+                        "checked": False, "safe": True, "lnode": ln,
+                        "rnode": None, "verify": ""})
+            stats["only_local_files"] += ln.nfiles
+            stats["only_local_bytes"] += ln.nbytes
+        for rn in rk.values():
+            ops.append({"kind": "only_remote_dir", "local": "", "remote": rn.path,
+                        "local_name": "", "remote_name": rn.name,
+                        "nfiles": rn.nfiles, "nbytes": rn.nbytes, "common": 0,
+                        "match": 0.0, "jaccard": 0.0, "how": "", "depth": rn.depth,
+                        "checked": False, "safe": True, "lnode": None,
+                        "rnode": rn, "verify": ""})
+            stats["only_remote_files"] += rn.nfiles
+            stats["only_remote_bytes"] += rn.nbytes
+        # 5. files directly in this folder
+        lf, rf = dict(L.files), dict(R.files)
+        for name in list(lf):
+            if name in rf:
+                if lf[name][0] == rf[name][0]:
+                    stats["same_files"] += 1
+                else:
+                    stats["differ_files"] += 1
+                lf.pop(name)
+                rf.pop(name)
+        # renamed FILES: same size + same MD5 (checked later, needs hashing)
+        for lname, (lsz, _h) in lf.items():
+            for rname, (rsz, rmd5) in rf.items():
+                if lsz == rsz and rmd5:
+                    file_cands.append((L, R, lname, rname, lsz, rmd5))
+        stats["only_local_files"] += len(lf)
+        stats["only_local_bytes"] += sum(sz for sz, _h in lf.values())
+        stats["only_remote_files"] += len(rf)
+        stats["only_remote_bytes"] += sum(sz for sz, _h in rf.values())
+        # 6. recurse into every pair
+        for ln, rn, _how in paired:
+            level(ln, rn)
+
+    level(local, remote)
+    return {"ops": ops, "file_cands": file_cands, "stats": stats}
+
+
+def _reconcile_verify_pair(op: dict, local_root: str, samples: int) -> str:
+    """MD5-check up to `samples` files that both sides of a rename share.
+    Returns a short verdict for the table; marks op['safe'] False on a
+    mismatch."""
+    ln, rn = op.get("lnode"), op.get("rnode")
+    if ln is None or rn is None:
+        return ""
+    rem_index: dict = {}
+    for rel, sz, md5 in rn.walk_files():
+        if md5:
+            rem_index.setdefault((rel.rpartition("/")[2], sz), (rel, md5))
+    if not rem_index:
+        return "size only (no MD5 on Pawsey)"
+    loc_index: dict = {}
+    for rel, sz, _h in ln.walk_files():
+        key = (rel.rpartition("/")[2], sz)
+        if key in rem_index and key not in loc_index:
+            loc_index[key] = rel
+    keys = sorted(loc_index)
+    if not keys:
+        return "size only"
+    if len(keys) > samples:
+        # spread the sample across the folder: first, middle(s), last
+        step = (len(keys) - 1) / (samples - 1) if samples > 1 else 1
+        keys = [keys[int(round(i * step))] for i in range(samples)]
+    ok = bad = 0
+    for key in keys:
+        lrel = loc_index[key]
+        _rrel, rmd5 = rem_index[key]
+        try:
+            lmd5 = _md5_of_file(os.path.join(local_root, lrel.replace("/", os.sep)))
+        except OSError:
+            continue
+        if lmd5 == rmd5:
+            ok += 1
+        else:
+            bad += 1
+    if bad:
+        op["safe"] = False
+        op["checked"] = False
+        return f"MD5 MISMATCH {bad}/{ok + bad} - not the same data"
+    return f"MD5 OK {ok}/{ok}"
+
+
+def _reconcile_file_renames(file_cands: list, local_root: str) -> list:
+    """Turn (same size, same MD5) candidates into rename_file ops by hashing
+    the local file once. Hashing is capped so a huge tree can't stall."""
+    ops: list = []
+    hashed: dict = {}
+    budget = RECONCILE_MAX_FILE_HASH_BYTES
+    used_remote: set = set()
+    used_local: set = set()
+    for L, R, lname, rname, size, rmd5 in file_cands:
+        lrel = f"{L.path}/{lname}" if L.path else lname
+        rrel = f"{R.path}/{rname}" if R.path else rname
+        if lrel in used_local or rrel in used_remote:
+            continue
+        if lrel not in hashed:
+            if budget - size < 0:
+                continue
+            budget -= size
+            try:
+                hashed[lrel] = _md5_of_file(
+                    os.path.join(local_root, lrel.replace("/", os.sep)))
+            except OSError:
+                hashed[lrel] = ""
+        if hashed[lrel] and hashed[lrel] == rmd5:
+            used_local.add(lrel)
+            used_remote.add(rrel)
+            ops.append({"kind": "rename_file", "local": lrel, "remote": rrel,
+                        "local_name": lname, "remote_name": rname,
+                        "nfiles": 1, "nbytes": size, "common": 1, "match": 1.0,
+                        "jaccard": 1.0, "how": "md5", "depth": L.depth + 1,
+                        "checked": True, "safe": True, "lnode": None,
+                        "rnode": None, "verify": "MD5 OK 1/1"})
+    return ops
+
+
+# ---------------------------------------------------------------------------
 
 class ConfigManager:
     def __init__(self) -> None:
@@ -1388,6 +1815,7 @@ class PawseyApp:
         self.tab_transfer = ttk.Frame(nb)
         self.tab_buckets = ttk.Frame(nb)
         self.tab_storage = ttk.Frame(nb)
+        self.tab_reconcile = ttk.Frame(nb)
         self.tab_console = ttk.Frame(nb)
         self.tab_history = ttk.Frame(nb)
         self.tab_settings = ttk.Frame(nb)
@@ -1396,6 +1824,7 @@ class PawseyApp:
         nb.add(self.tab_transfer, text="  Transfer  ")
         nb.add(self.tab_buckets, text="  Buckets  ")
         nb.add(self.tab_storage, text="  Storage  ")
+        nb.add(self.tab_reconcile, text="  Rename / Match  ")
         nb.add(self.tab_console, text="  Console  ")
         nb.add(self.tab_history, text="  History  ")
         nb.add(self.tab_settings, text="  Settings  ")
@@ -1413,6 +1842,7 @@ class PawseyApp:
         self._build_transfer_tab()
         self._build_buckets_tab()
         self._build_storage_tab()
+        self._build_reconcile_tab()
         self._build_console_tab()
         self._build_history_tab()
         self._build_settings_tab()
@@ -6639,6 +7069,846 @@ function filt(q) {{
         step(0)
 
 
+    # ------------------------------------------------------- Rename / Match
+    # v2.5. See the module-level "reconcile" helpers (_TreeNode,
+    # _reconcile_trees, ...) for the matching itself; this is the tab.
+
+    def _build_reconcile_tab(self) -> None:
+        t = self.tab_reconcile
+        t.columnconfigure(0, weight=1)
+        t.rowconfigure(6, weight=1)
+
+        ttk.Label(t, text="Rename / Match - apply folder renames without re-uploading",
+                  style="Big.TLabel").grid(row=0, column=0, sticky="w",
+                                           padx=10, pady=(10, 2))
+        ttk.Label(
+            t,
+            text="Renamed a project, site or date folder on this PC after it was "
+                 "uploaded? A normal sync re-uploads it all under the new name. "
+                 "This tab pairs folders by their CONTENTS (file names + sizes, "
+                 "MD5 spot-checks), lists the ones that only differ by name, and "
+                 "renames them server-side on Pawsey (seconds, no transfer) - or "
+                 "renames the local folders to match Pawsey. Then run your usual "
+                 "Transfer for the files that are genuinely new.",
+            style="Muted.TLabel", wraplength=1060, justify="left",
+        ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+
+        # --- Local side ---
+        lf = ttk.Frame(t)
+        lf.grid(row=2, column=0, sticky="ew", padx=10)
+        lf.columnconfigure(1, weight=1)
+        ttk.Label(lf, text="Local folder:").grid(row=0, column=0, sticky="w")
+        self.rec_local_var = tk.StringVar(value="")
+        ttk.Entry(lf, textvariable=self.rec_local_var).grid(
+            row=0, column=1, sticky="ew", padx=(4, 6))
+        ttk.Button(lf, text="Browse…",
+                   command=lambda: self._pick_dir(self.rec_local_var)).grid(
+            row=0, column=2)
+        ttk.Button(lf, text="Use Transfer tab source & destination",
+                   command=self._reconcile_from_transfer).grid(
+            row=0, column=3, padx=(6, 0))
+
+        # --- Pawsey side ---
+        pf = ttk.Frame(t)
+        pf.grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 0))
+        for c in (3, 5):
+            pf.columnconfigure(c, weight=1)
+        ttk.Label(pf, text="Pawsey folder:").grid(row=0, column=0, sticky="w")
+        ttk.Label(pf, text="Remote:").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.rec_remote_var = tk.StringVar(value=self.cfg.get("remote_name"))
+        self.rec_remote_combo = ttk.Combobox(
+            pf, textvariable=self.rec_remote_var, width=14, state="readonly")
+        self.rec_remote_combo.grid(row=0, column=2, sticky="w", padx=(4, 8))
+        ttk.Label(pf, text="Bucket:").grid(row=0, column=3, sticky="e")
+        self.rec_bucket_var = tk.StringVar(value=self.cfg.get("default_bucket"))
+        ttk.Entry(pf, textvariable=self.rec_bucket_var, width=24).grid(
+            row=0, column=4, sticky="w", padx=(4, 8))
+        ttk.Label(pf, text="Path of the folder that corresponds to the local folder:").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.rec_path_var = tk.StringVar(value="")
+        ttk.Entry(pf, textvariable=self.rec_path_var).grid(
+            row=1, column=3, columnspan=2, sticky="ew", padx=(4, 0), pady=(4, 0))
+        ttk.Button(pf, text="Find on Pawsey by content…",
+                   command=self._reconcile_find_remote).grid(
+            row=1, column=5, sticky="w", padx=(6, 0), pady=(4, 0))
+        self.rec_preview = ttk.Label(pf, text="", foreground="#1a5d8a")
+        self.rec_preview.grid(row=2, column=0, columnspan=6, sticky="w", pady=(2, 0))
+        for var in (self.rec_local_var, self.rec_remote_var,
+                    self.rec_bucket_var, self.rec_path_var):
+            var.trace_add("write", lambda *a: self._reconcile_update_preview())
+
+        # --- Options ---
+        opts = ttk.LabelFrame(t, text="Options")
+        opts.grid(row=4, column=0, sticky="ew", padx=10, pady=(8, 0))
+        ttk.Label(opts, text="Which side gets renamed:").grid(
+            row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+        self.rec_direction = tk.StringVar(value="pawsey")
+        ttk.Radiobutton(
+            opts, text="Rename on Pawsey to match this PC (server-side move, no upload)",
+            variable=self.rec_direction, value="pawsey",
+            command=self._reconcile_refresh_table).grid(
+            row=0, column=1, sticky="w", padx=4)
+        ttk.Radiobutton(
+            opts, text="Rename local folders to match Pawsey",
+            variable=self.rec_direction, value="local",
+            command=self._reconcile_refresh_table).grid(
+            row=0, column=2, sticky="w", padx=4)
+        self.rec_verify = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts, text=f"Spot-check each match with MD5 ({RECONCILE_VERIFY_SAMPLES} files per folder)",
+            variable=self.rec_verify).grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
+        ttk.Label(opts, text="Minimum content match:").grid(
+            row=1, column=2, sticky="e", padx=(8, 4))
+        self.rec_threshold = tk.IntVar(value=int(RECONCILE_MATCH_THRESHOLD * 100))
+        ttk.Spinbox(opts, from_=50, to=100, increment=5, width=5,
+                    textvariable=self.rec_threshold).grid(
+            row=1, column=3, sticky="w")
+        ttk.Label(opts, text="%").grid(row=1, column=4, sticky="w")
+
+        # --- Buttons ---
+        br = ttk.Frame(t)
+        br.grid(row=5, column=0, sticky="ew", padx=10, pady=(8, 4))
+        self.rec_scan_btn = ttk.Button(br, text="Scan & compare",
+                                       command=self._reconcile_scan,
+                                       style="Accent.TButton")
+        self.rec_scan_btn.pack(side="left", padx=2)
+        ttk.Button(br, text="Tick all renames",
+                   command=lambda: self._reconcile_tick(True)).pack(side="left", padx=2)
+        ttk.Button(br, text="Untick all",
+                   command=lambda: self._reconcile_tick(False)).pack(side="left", padx=2)
+        self.rec_apply_btn = ttk.Button(br, text="Apply ticked actions",
+                                        command=self._reconcile_apply,
+                                        style="Danger.TButton", state="disabled")
+        self.rec_apply_btn.pack(side="left", padx=(12, 2))
+        self.rec_summary = ttk.Label(br, text="No scan yet.", style="Muted.TLabel")
+        self.rec_summary.pack(side="left", padx=12)
+
+        # --- Results table ---
+        tf = ttk.Frame(t)
+        tf.grid(row=6, column=0, sticky="nsew", padx=10)
+        tf.columnconfigure(0, weight=1)
+        tf.rowconfigure(0, weight=1)
+        cols = ("action", "local", "pawsey", "files", "size", "match", "verify", "status")
+        self.rec_tree = ttk.Treeview(tf, columns=cols, show="tree headings",
+                                     selectmode="extended", height=12)
+        self.rec_tree.heading("#0", text="✓", anchor="w")
+        self.rec_tree.column("#0", width=36, minwidth=30, stretch=False, anchor="center")
+        heads = {"action": ("Action", 150, "w"), "local": ("Local folder / file", 280, "w"),
+                 "pawsey": ("Pawsey folder / file", 280, "w"),
+                 "files": ("Files", 60, "e"), "size": ("Size", 80, "e"),
+                 "match": ("Match", 60, "e"), "verify": ("Checked", 150, "w"),
+                 "status": ("Status", 120, "w")}
+        for c in cols:
+            text, w, anchor = heads[c]
+            self.rec_tree.heading(c, text=text, anchor="w")
+            self.rec_tree.column(c, width=w, minwidth=40,
+                                 stretch=(c in ("local", "pawsey")), anchor=anchor)
+        self.rec_tree.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self.rec_tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.rec_tree.configure(yscrollcommand=vsb.set)
+        self.rec_tree.tag_configure("rename", foreground="#1a5d8a")
+        self.rec_tree.tag_configure("delete", foreground="#a33")
+        self.rec_tree.tag_configure("info", foreground="#777")
+        self.rec_tree.tag_configure("bad", foreground="#a33", background="#fde8e8")
+        self.rec_tree.tag_configure("done", foreground="#2a7a2a")
+        self.rec_tree.bind("<ButtonRelease-1>", self._reconcile_on_click)
+        self.rec_tree.bind("<space>", lambda e: self._reconcile_toggle_selected())
+        self.rec_tree.bind("<Double-1>", lambda e: self._reconcile_show_detail())
+
+        # --- Notes + progress ---
+        bottom = ttk.LabelFrame(t, text="Action note (required to apply)  +  progress")
+        bottom.grid(row=7, column=0, sticky="ew", padx=10, pady=(6, 10))
+        bottom.columnconfigure(0, weight=1)
+        self.rec_notes = scrolledtext.ScrolledText(bottom, height=1, wrap="word")
+        self.rec_notes.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
+        self.rec_progress = ttk.Progressbar(bottom, mode="determinate", maximum=100)
+        self.rec_progress.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 2))
+        self.rec_log = scrolledtext.ScrolledText(
+            bottom, height=4, wrap="word",
+            font=("Consolas" if IS_WINDOWS else "Monospace", 9))
+        self.rec_log.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.rec_log.configure(state="disabled")
+
+        self._rec_ops: list = []
+        self._rec_busy = False
+        self._rec_local_root = ""
+        self._rec_remote_loc = ""
+        remotes = RcloneRemote.list_remotes()
+        if remotes:
+            self.rec_remote_combo["values"] = remotes
+            if self.rec_remote_var.get() not in remotes:
+                self.rec_remote_var.set(remotes[0])
+        self._reconcile_update_preview()
+
+    # ----- small helpers --------------------------------------------------
+    def _reconcile_remote_location(self) -> str:
+        remote = self.rec_remote_var.get().strip()
+        bucket = self.rec_bucket_var.get().strip().strip("/")
+        path = self.rec_path_var.get().strip().strip("/").replace("\\", "/")
+        if not remote or not bucket:
+            return ""
+        return f"{remote}:{bucket}" + (f"/{path}" if path else "")
+
+    def _reconcile_update_preview(self) -> None:
+        if not hasattr(self, "rec_preview"):
+            return
+        loc = self._reconcile_remote_location()
+        local = self.rec_local_var.get().strip()
+        if loc and local:
+            self.rec_preview.configure(
+                text=f"Compare  {local}  ⟷  {loc}")
+        else:
+            self.rec_preview.configure(text="Pick a local folder and its Pawsey counterpart.")
+
+    def _reconcile_from_transfer(self) -> None:
+        """Copy the Transfer tab's source + effective destination here."""
+        src = self.src_var.get().strip()
+        remote = self.remote_var.get().strip()
+        bucket = self.bucket_var.get().strip()
+        path = self.path_var.get().strip()
+        dest = self._effective_dest(remote, bucket, path, src)
+        after = dest.partition(":")[2]
+        b, _, p = after.partition("/")
+        self.rec_local_var.set(src)
+        if remote:
+            self.rec_remote_var.set(remote)
+        self.rec_bucket_var.set(b)
+        self.rec_path_var.set(p)
+
+    def _reconcile_log(self, text: str) -> None:
+        self.rec_log.configure(state="normal")
+        self.rec_log.insert("end", text if text.endswith("\n") else text + "\n")
+        end = self.rec_log.index("end-1c")
+        try:
+            lines = int(end.split(".")[0])
+        except Exception:
+            lines = 0
+        if lines > 600:
+            self.rec_log.delete("1.0", f"{lines - 500}.0")
+        self.rec_log.see("end")
+        self.rec_log.configure(state="disabled")
+
+    def _reconcile_log_bg(self, text: str) -> None:
+        """Log from a worker thread (delivered on the Tk thread)."""
+        self._bg_queue.put((lambda _r, _e, l=text: self._reconcile_log(l), None, None))
+
+    def _reconcile_set_busy(self, busy: bool) -> None:
+        self._rec_busy = busy
+        self.rec_scan_btn.configure(state="disabled" if busy else "normal")
+        self.rec_apply_btn.configure(
+            state="disabled" if (busy or not self._rec_ops) else "normal")
+        if busy:
+            self.rec_progress.configure(mode="indeterminate")
+            self.rec_progress.start(12)
+        else:
+            self.rec_progress.stop()
+            self.rec_progress.configure(mode="determinate", value=0)
+
+    # ----- find the Pawsey counterpart by content ---------------------------
+    def _reconcile_find_remote(self) -> None:
+        """The project folder ITSELF may have been renamed. Look through the
+        folders of the bucket (or of the parent path typed in the Path box)
+        and pick the one whose contents match the local folder, whatever it
+        is called.
+
+        Listing a whole bucket is slow (dpird-appn-2026: 133k objects, ~3.5
+        min), so candidates are listed ONE AT A TIME, most similar name
+        first, and the search stops as soon as a convincing match is found
+        (a renamed project usually still looks like its old name, so this
+        is normally the first or second folder - seconds, not minutes).
+        Once a hit is found, the remaining candidates whose names are also
+        similar are still checked, so a partial duplicate can't win over
+        the real copy just because it was listed first.
+        """
+        if self._rec_busy:
+            return
+        local = self.rec_local_var.get().strip()
+        remote = self.rec_remote_var.get().strip()
+        bucket = self.rec_bucket_var.get().strip().strip("/")
+        if not local or not Path(local).is_dir():
+            messagebox.showerror(APP_NAME, "Pick an existing local folder first.")
+            return
+        if not remote or not bucket:
+            messagebox.showerror(APP_NAME, "Pick the Pawsey remote and bucket first.")
+            return
+        parent = self.rec_path_var.get().strip().strip("/").replace("\\", "/")
+        if parent and Path(local).name == parent.split("/")[-1]:
+            # the box holds the project path already: search its PARENT
+            parent = parent.rpartition("/")[0]
+        base = f"{remote}:{bucket}" + (f"/{parent}" if parent else "")
+        try:
+            threshold = max(0.5, min(1.0, int(self.rec_threshold.get()) / 100.0))
+        except Exception:
+            threshold = RECONCILE_MATCH_THRESHOLD
+        self._reconcile_set_busy(True)
+        self.status_var.set(f"Rename / Match: looking for {Path(local).name} under {base}…")
+        self._reconcile_log(f"=== Find on Pawsey by content  ({datetime.now():%H:%M:%S}) ===")
+        self._reconcile_log(f"Local : {local}")
+        self._reconcile_log(f"Search: every folder directly under {base}")
+
+        def work():
+            ltree = _build_local_tree(local)
+            self._reconcile_log_bg(
+                f"    local: {ltree.nfiles:,} files, {human_bytes(ltree.nbytes)}")
+            rc, out, err = _run_rclone_split(
+                ["lsf", base, "--dirs-only", S3_MARKER_FLAG,
+                 *_app_prefix_excludes()], timeout=3600)
+            if rc != 0:
+                raise RuntimeError(f"Could not list {base}:\n{err or out}")
+            names = [ln.strip().rstrip("/") for ln in out.splitlines() if ln.strip()]
+            names = [n for n in names if n and n not in APP_MANAGED_PREFIXES]
+            if not names:
+                raise RuntimeError(f"There are no folders under {base}.")
+            # most similar name first: a renamed project usually still
+            # resembles its old name, so the right folder is found early
+            names.sort(key=lambda n: -_name_similarity(n, ltree.name))
+            self._reconcile_log_bg(
+                f"    {len(names)} folder(s) under {base}; checking the most "
+                f"similar names first…")
+            scored = []
+            best_common = 0
+            for i, name in enumerate(names, 1):
+                sim = _name_similarity(name, ltree.name)
+                # Once a convincing match exists, only folders whose name is
+                # nearly the same as the local one are still worth a look
+                # (a partial duplicate from an interrupted sync carries the
+                # local name); everything else is skipped to save minutes.
+                if best_common and sim < 0.8:
+                    self._reconcile_log_bg(
+                        f"    match found - skipping the remaining "
+                        f"{len(names) - i + 1} folder(s) with different names")
+                    break
+                t0 = datetime.now()
+                self._reconcile_log_bg(f"    [{i}/{len(names)}] listing {name} …")
+                node, err = _build_remote_tree(f"{base}/{name}")
+                if err:
+                    self._reconcile_log_bg(f"        (could not list: {err[:120]})")
+                    continue
+                common, cont, jac = _containment(ltree.sig, node.sig)
+                secs = (datetime.now() - t0).total_seconds()
+                self._reconcile_log_bg(
+                    f"        {node.nfiles:,} files, {common:,} in common "
+                    f"({cont * 100:.0f}%), {secs:.0f}s")
+                if common:
+                    scored.append((cont, jac, common, name, node.nfiles, node.nbytes))
+                if cont >= threshold and common > best_common:
+                    best_common = common
+            scored.sort(key=lambda s: (s[0] >= threshold, s[2], s[0]), reverse=True)
+            return ltree, scored
+
+        def done(result, err):
+            self._reconcile_set_busy(False)
+            if err:
+                self._reconcile_log(f"✗ {err}")
+                self.status_var.set("Rename / Match: search failed.")
+                messagebox.showerror(APP_NAME, f"Search failed:\n\n{err}")
+                return
+            ltree, scored = result
+            if not scored or scored[0][0] < threshold:
+                top = ("\n".join(f"  {n}: {c * 100:.0f}% of files in common ({k:,} files)"
+                                 for c, j, k, n, nf, nb in scored[:5])
+                       or "  (nothing in common)")
+                self._reconcile_log("No folder under " + base + " holds this data.")
+                self.status_var.set("Rename / Match: no matching folder found.")
+                messagebox.showinfo(
+                    APP_NAME,
+                    f"No folder directly under {base} holds the same files as\n"
+                    f"{local}\n\nBest candidates:\n{top}\n\nIf the project lives "
+                    f"deeper in the bucket, type its parent path in the Path box "
+                    f"and search again. If it was never uploaded, use the "
+                    f"Transfer tab.")
+                return
+            cont, jac, common, name, nf, nb = scored[0]
+            path = (f"{parent}/{name}" if parent else name)
+            self.rec_path_var.set(path)
+            same = ("the same name" if name == ltree.name
+                    else f"a DIFFERENT name ('{name}' vs local '{ltree.name}')")
+            self._reconcile_log(
+                f"✓ Match: {remote}:{bucket}/{path}  -  {cont * 100:.0f}% of the smaller "
+                f"side's files in common ({common:,} files; Pawsey folder has {nf:,} "
+                f"files, {human_bytes(nb)}). It has {same}.")
+            for c, j, k, n, _nf, _nb in scored[1:4]:
+                self._reconcile_log(f"    runner-up: {n}  {c * 100:.0f}% ({k:,} files in common)")
+            self.status_var.set(f"Rename / Match: found {path}")
+            messagebox.showinfo(
+                APP_NAME,
+                f"Found it: {remote}:{bucket}/{path}\n\n{common:,} files in common "
+                f"({cont * 100:.0f}% of the smaller side). The Pawsey folder has {same}.\n\n"
+                f"Now click 'Scan & compare' to list the renames inside it"
+                + ("; the top-level rename will be offered as its own row."
+                   if name != ltree.name else "."))
+
+        self._bg_call(work, done)
+
+    # ----- scan -----------------------------------------------------------
+    def _reconcile_scan(self) -> None:
+        if self._rec_busy:
+            return
+        local = self.rec_local_var.get().strip()
+        loc = self._reconcile_remote_location()
+        if not local or not Path(local).is_dir():
+            messagebox.showerror(APP_NAME, "Pick an existing local folder first.")
+            return
+        if not loc:
+            messagebox.showerror(APP_NAME, "Pick the Pawsey remote and bucket first.")
+            return
+        try:
+            threshold = max(0.5, min(1.0, int(self.rec_threshold.get()) / 100.0))
+        except Exception:
+            threshold = RECONCILE_MATCH_THRESHOLD
+        verify = bool(self.rec_verify.get())
+        self._rec_ops = []
+        self._rec_local_root = local
+        self._rec_remote_loc = loc
+        for iid in self.rec_tree.get_children(""):
+            self.rec_tree.delete(iid)
+        self.rec_log.configure(state="normal")
+        self.rec_log.delete("1.0", "end")
+        self.rec_log.configure(state="disabled")
+        self._reconcile_set_busy(True)
+        self.rec_summary.configure(text="Scanning…")
+        self.status_var.set("Rename / Match: scanning both sides…")
+        self._reconcile_log(f"=== Scan  ({datetime.now():%H:%M:%S}) ===")
+        self._reconcile_log(f"Local : {local}")
+        self._reconcile_log(f"Pawsey: {loc}")
+
+        def work():
+            t0 = datetime.now()
+            self._reconcile_log_bg("Listing local folder…")
+            ltree = _build_local_tree(local)
+            self._reconcile_log_bg(
+                f"    {ltree.nfiles:,} files, {human_bytes(ltree.nbytes)}, "
+                f"{(datetime.now() - t0).total_seconds():.0f}s")
+            t1 = datetime.now()
+            self._reconcile_log_bg("Listing Pawsey folder (one listing, with MD5s)…")
+            rtree, err = _build_remote_tree(loc)
+            if err:
+                raise RuntimeError(f"Could not list {loc}:\n{err}")
+            self._reconcile_log_bg(
+                f"    {rtree.nfiles:,} files, {human_bytes(rtree.nbytes)}, "
+                f"{(datetime.now() - t1).total_seconds():.0f}s")
+            if rtree.nfiles == 0 and not rtree.dirs:
+                raise RuntimeError(
+                    f"Nothing found under {loc}.\nCheck the bucket and path - "
+                    f"the path must be the Pawsey folder that corresponds to the "
+                    f"local folder (it may have a different name).")
+            self._reconcile_log_bg("Matching folders by content…")
+            res = _reconcile_trees(ltree, rtree, threshold)
+            ops = res["ops"]
+            if verify:
+                todo = [o for o in ops if o["kind"] == "rename_dir"]
+                for i, op in enumerate(todo, 1):
+                    self._reconcile_log_bg(
+                        f"    MD5 spot-check {i}/{len(todo)}: {op['local']}  ⟷  {op['remote']}")
+                    op["verify"] = _reconcile_verify_pair(
+                        op, local, RECONCILE_VERIFY_SAMPLES)
+            else:
+                for op in ops:
+                    if op["kind"] == "rename_dir":
+                        op["verify"] = "name + size only"
+            if res["file_cands"]:
+                self._reconcile_log_bg(
+                    f"Checking {len(res['file_cands'])} possible renamed file(s) by MD5…")
+                ops.extend(_reconcile_file_renames(res["file_cands"], local))
+            return ltree, rtree, res["stats"], ops
+
+        def done(result, err):
+            self._reconcile_set_busy(False)
+            if err:
+                self.rec_summary.configure(text="Scan failed.")
+                self.status_var.set("Rename / Match: scan failed.")
+                self._reconcile_log(f"✗ {err}")
+                messagebox.showerror(APP_NAME, f"Scan failed:\n\n{err}")
+                return
+            ltree, rtree, stats, ops = result
+            # top-level name difference (the project folder itself)
+            if ltree.name and rtree.name and ltree.name != rtree.name:
+                common, cont, jac = _containment(ltree.sig, rtree.sig)
+                ops.insert(0, {
+                    "kind": "rename_root", "local": "", "remote": "",
+                    "local_name": ltree.name, "remote_name": rtree.name,
+                    "nfiles": max(ltree.nfiles, rtree.nfiles),
+                    "nbytes": max(ltree.nbytes, rtree.nbytes), "common": common,
+                    "match": cont, "jaccard": jac, "how": "root", "depth": 0,
+                    "checked": False, "safe": True, "lnode": ltree,
+                    "rnode": rtree, "verify": "",
+                    "note": "the two top-level folders themselves have different names"})
+            order = {"remove_dup": 0, "conflict": 1, "rename_root": 2, "rename_dir": 3,
+                     "rename_file": 4, "only_remote_dir": 5, "only_local_dir": 6}
+            ops.sort(key=lambda o: (order.get(o["kind"], 9), o["depth"], o["local"], o["remote"]))
+            self._rec_ops = ops
+            self._rec_stats = stats
+            self._reconcile_refresh_table()
+            n_ren = sum(1 for o in ops if o["kind"] in ("rename_dir", "rename_file"))
+            n_dup = sum(1 for o in ops if o["kind"] == "remove_dup")
+            n_conf = sum(1 for o in ops if o["kind"] == "conflict")
+            n_or = sum(1 for o in ops if o["kind"] == "only_remote_dir")
+            n_ol = sum(1 for o in ops if o["kind"] == "only_local_dir")
+            # bytes spared: count a renamed folder once, not again for every
+            # renamed sub-folder inside it
+            ren_paths = [o["local"] for o in ops if o["kind"] == "rename_dir"]
+            saved = sum(o["nbytes"] for o in ops if o["kind"] == "rename_dir"
+                        and not any(o["local"].startswith(p + "/") for p in ren_paths
+                                    if p != o["local"]))
+            summary = f"{n_ren} rename(s)"
+            if saved:
+                summary += f" · {human_bytes(saved)} spared from re-upload"
+            if n_dup:
+                summary += f" · {n_dup} partial duplicate(s)"
+            if n_conf:
+                summary += f" · {n_conf} conflict(s)"
+            if n_or or n_ol:
+                summary += f" · {n_ol} only-local / {n_or} only-Pawsey folder(s)"
+            self.rec_summary.configure(text=summary)
+            self._reconcile_log("— Scan complete. " + summary)
+            self._reconcile_log(
+                f"After the renames: {stats['same_files']:,} files identical by "
+                f"name+size, {stats['differ_files']:,} differ in size, "
+                f"{stats['only_local_files']:,} files / {human_bytes(stats['only_local_bytes'])} "
+                f"only on this PC (next Transfer uploads them), "
+                f"{stats['only_remote_files']:,} files / {human_bytes(stats['only_remote_bytes'])} "
+                f"only on Pawsey.")
+            if not ops:
+                self._reconcile_log("Both sides already use the same folder names.")
+            self.status_var.set("Rename / Match: " + summary)
+            self.rec_apply_btn.configure(state="normal" if ops else "disabled")
+
+        self._bg_call(work, done)
+
+    # ----- table ----------------------------------------------------------
+    def _reconcile_row_values(self, op: dict) -> tuple:
+        k = op["kind"]
+        to_pawsey = self.rec_direction.get() == "pawsey"
+        local_col, pawsey_col = op["local"], op["remote"]
+        if k in ("rename_dir", "rename_file", "rename_root"):
+            if k == "rename_root":
+                local_col, pawsey_col = op["local_name"], op["remote_name"]
+            if to_pawsey:
+                action = ("Rename on Pawsey" if k != "rename_file"
+                          else "Rename file on Pawsey")
+                pawsey_col = f"{pawsey_col}  →  {op['local_name']}"
+            else:
+                action = ("Rename locally" if k != "rename_file"
+                          else "Rename local file")
+                local_col = f"{local_col}  →  {op['remote_name']}"
+            tag = "rename" if op["safe"] else "bad"
+        elif k == "remove_dup":
+            action = "Remove partial copy on Pawsey"
+            tag = "delete"
+        elif k == "conflict":
+            action = "Conflict - by hand"
+            tag = "bad"
+        elif k == "only_remote_dir":
+            action = "Delete from Pawsey?"
+            tag = "delete"
+        else:
+            action = "Only on this PC (upload later)"
+            tag = "info"
+        if k in ("only_local_dir", "conflict"):
+            check = "·"
+        else:
+            check = "☑" if op["checked"] else "☐"
+        match = f"{op['match'] * 100:.0f}%" if op.get("match") else ""
+        status = op.get("status", "")
+        if k in ("remove_dup", "conflict", "rename_root") and not status:
+            status = op.get("note", "")
+        return (check, action, local_col, pawsey_col, f"{op['nfiles']:,}",
+                human_bytes(op["nbytes"]), match, op.get("verify", ""), status, tag)
+
+    def _reconcile_refresh_table(self) -> None:
+        if not hasattr(self, "rec_tree"):
+            return
+        for iid in self.rec_tree.get_children(""):
+            self.rec_tree.delete(iid)
+        for i, op in enumerate(self._rec_ops):
+            check, *vals, tag = self._reconcile_row_values(op)
+            tags = (tag,) if not op.get("status", "").startswith("✓") else ("done",)
+            self.rec_tree.insert("", "end", iid=str(i), text=check,
+                                 values=tuple(vals), tags=tags)
+
+    def _reconcile_update_row(self, i: int) -> None:
+        op = self._rec_ops[i]
+        check, *vals, tag = self._reconcile_row_values(op)
+        if self.rec_tree.exists(str(i)):
+            tags = (tag,) if not op.get("status", "").startswith("✓") else ("done",)
+            self.rec_tree.item(str(i), text=check, values=tuple(vals), tags=tags)
+
+    def _reconcile_toggle(self, i: int) -> None:
+        op = self._rec_ops[i]
+        if op["kind"] in ("only_local_dir", "conflict"):
+            return
+        if op.get("status", "").startswith("✓"):
+            return
+        if not op["checked"] and not op["safe"]:
+            if not messagebox.askyesno(
+                    APP_NAME,
+                    "The MD5 spot-check says these two folders do NOT hold the "
+                    "same data. Tick it anyway?", icon="warning"):
+                return
+        op["checked"] = not op["checked"]
+        self._reconcile_update_row(i)
+
+    def _reconcile_on_click(self, event) -> None:
+        if self.rec_tree.identify("region", event.x, event.y) not in ("tree", "cell"):
+            return
+        if self.rec_tree.identify_column(event.x) != "#0":
+            return
+        iid = self.rec_tree.identify_row(event.y)
+        if iid:
+            self._reconcile_toggle(int(iid))
+
+    def _reconcile_toggle_selected(self) -> None:
+        for iid in self.rec_tree.selection():
+            self._reconcile_toggle(int(iid))
+
+    def _reconcile_tick(self, on: bool) -> None:
+        for i, op in enumerate(self._rec_ops):
+            if op.get("status", "").startswith("✓"):
+                continue
+            if on:
+                if op["kind"] in ("rename_dir", "rename_file") and op["safe"]:
+                    op["checked"] = True
+            else:
+                if op["kind"] not in ("only_local_dir", "conflict"):
+                    op["checked"] = False
+            self._reconcile_update_row(i)
+
+    def _reconcile_show_detail(self) -> None:
+        sel = self.rec_tree.selection()
+        if not sel:
+            return
+        op = self._rec_ops[int(sel[0])]
+        lines = [f"Kind: {op['kind']}",
+                 f"Local : {op['local'] or op['local_name'] or '-'}",
+                 f"Pawsey: {op['remote'] or op['remote_name'] or '-'}",
+                 f"Files: {op['nfiles']:,}   Size: {human_bytes(op['nbytes'])}",
+                 f"Files in common (name+size): {op.get('common', 0):,}",
+                 f"Match: {op['match'] * 100:.1f}%   Jaccard: {op.get('jaccard', 0) * 100:.1f}%",
+                 f"Checked: {op.get('verify') or '-'}"]
+        if op.get("note"):
+            lines.append(f"Note: {op['note']}")
+        if op.get("status"):
+            lines.append(f"Status: {op['status']}")
+        messagebox.showinfo("Match details", "\n".join(lines))
+
+    # ----- apply ----------------------------------------------------------
+    def _reconcile_apply(self) -> None:
+        if self._rec_busy:
+            return
+        notes = self.rec_notes.get("1.0", "end").strip()
+        if not notes:
+            messagebox.showerror(
+                APP_NAME, "Please write an action note first. It is saved "
+                          "permanently to the transfer log.")
+            return
+        todo = [(i, op) for i, op in enumerate(self._rec_ops)
+                if op["checked"] and not op.get("status", "").startswith("✓")]
+        if not todo:
+            messagebox.showinfo(APP_NAME, "Nothing is ticked.")
+            return
+        to_pawsey = self.rec_direction.get() == "pawsey"
+        soft = bool(self.use_recycle_bin.get())
+        n_del = sum(1 for _i, o in todo if o["kind"] in ("remove_dup", "only_remote_dir"))
+        n_ren = len(todo) - n_del
+        side = "Pawsey (server-side moves, no data transfer)" if to_pawsey else "this PC"
+        msg = f"Apply {n_ren} rename(s) on {side}"
+        if n_del:
+            msg += (f" and {'move' if soft else 'PERMANENTLY DELETE'} {n_del} "
+                    f"folder(s) on Pawsey{' to the recycle bin' if soft else ''}")
+        msg += ":\n\n"
+        for _i, op in todo[:14]:
+            check, action, lc, pc, *_rest = self._reconcile_row_values(op)
+            msg += f"  • {action}: {pc if to_pawsey or op['kind'] != 'rename_dir' else lc}\n"
+        if len(todo) > 14:
+            msg += f"  … and {len(todo) - 14} more\n"
+        if not to_pawsey:
+            msg += "\nLocal renames use the operating system's rename (instant).\n"
+        msg += "\nContinue?"
+        if not messagebox.askyesno("Confirm Rename / Match",
+                                   msg, icon="warning" if n_del and not soft else "question"):
+            return
+        if n_del and not soft and not self._require_password(
+                "permanently delete folders on Pawsey"):
+            return
+
+        local_root = self._rec_local_root
+        loc = self._reconcile_remote_location()
+        remote = self.rec_remote_var.get().strip()
+        bucket = self.rec_bucket_var.get().strip().strip("/")
+        prefix = loc.partition(":")[2].partition("/")[2]       # path inside bucket
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Deepest first, so a child is renamed while its parent still has
+        # the old name (paths stay valid without any bookkeeping). Duplicate
+        # removals go before the rename that needs the name freed.
+        order = {"remove_dup": 0, "only_remote_dir": 0, "rename_file": 1,
+                 "rename_dir": 1, "rename_root": 2}
+        todo.sort(key=lambda t: (-t[1]["depth"], order.get(t[1]["kind"], 5)))
+
+        self._reconcile_set_busy(True)
+        self.rec_progress.stop()
+        self.rec_progress.configure(mode="determinate", maximum=len(todo), value=0)
+        self._reconcile_log(f"=== Apply {len(todo)} action(s)  ({datetime.now():%H:%M:%S}) ===")
+        self.status_var.set("Rename / Match: applying…")
+
+        def remote_full(rel: str) -> str:
+            base = f"{remote}:{bucket}" + (f"/{prefix}" if prefix else "")
+            return f"{base}/{rel}" if rel else base
+
+        def local_full(rel: str) -> str:
+            return os.path.join(local_root, rel.replace("/", os.sep)) if rel else local_root
+
+        def remote_has_content(path: str) -> Optional[bool]:
+            rc, out, _e = _run_rclone_split(
+                ["lsf", path, "--max-depth", "1", S3_MARKER_FLAG], timeout=600)
+            if rc != 0:
+                return None
+            return any(ln.strip() for ln in out.splitlines())
+
+        def do_remote_rename(src: str, dest: str, is_dir: bool) -> tuple:
+            if is_dir:
+                has = remote_has_content(dest)
+                if has:
+                    return False, "target folder already exists on Pawsey and is not empty"
+                run_rclone_capture(["mkdir", dest, "--s3-no-check-bucket",
+                                    S3_MARKER_FLAG], timeout=120)
+                rc, out = run_rclone_capture(
+                    ["move", src, dest, "--delete-empty-src-dirs", *EMPTY_DIR_FLAGS,
+                     "--s3-no-check-bucket", f"--checkers={self.cfg.get('checkers', 16)}",
+                     "--transfers=8"], timeout=86400)
+                if rc == 0:
+                    self._purge_empty_prefix(src)
+                return rc == 0, out.strip()[-400:]
+            rc, out = run_rclone_capture(
+                ["moveto", src, dest, "--s3-no-check-bucket"], timeout=86400)
+            return rc == 0, out.strip()[-400:]
+
+        def do_remote_delete(path: str, rel: str) -> tuple:
+            if soft:
+                trash = f"{remote}:{bucket}/{RECYCLE_PREFIX}/{ts}/" + (
+                    f"{prefix}/{rel}" if prefix else rel)
+                rc, out = run_rclone_capture(
+                    ["move", path, trash, "--s3-no-check-bucket",
+                     "--delete-empty-src-dirs", *EMPTY_DIR_FLAGS], timeout=86400)
+                if rc == 0:
+                    self._purge_empty_prefix(path)
+                return rc == 0, out.strip()[-400:]
+            rc, out = run_rclone_capture(
+                ["purge", path, *S3_DELETE_FLAGS], timeout=86400)
+            return rc == 0, out.strip()[-400:]
+
+        def do_local_rename(src: str, dest: str) -> tuple:
+            try:
+                if os.path.normcase(src) != os.path.normcase(dest) and os.path.exists(dest):
+                    return False, "target already exists locally"
+                os.rename(src, dest)
+                return True, ""
+            except OSError as e:
+                return False, str(e)
+
+        def work():
+            done_n = fail_n = 0
+            for n, (i, op) in enumerate(todo, 1):
+                k = op["kind"]
+                try:
+                    if k in ("remove_dup", "only_remote_dir"):
+                        path = remote_full(op["remote"])
+                        desc = (f"{'recycle' if soft else 'DELETE'} on Pawsey: {op['remote']}")
+                        self._reconcile_log_bg(f"[{n}/{len(todo)}] {desc}")
+                        ok, out = do_remote_delete(path, op["remote"])
+                        logop = "reconcile_recycle" if soft else "reconcile_delete"
+                        src_s, dst_s = path, ""
+                    elif k == "rename_root":
+                        if to_pawsey:
+                            parent = loc.rpartition("/")[0] if "/" in loc.partition(":")[2] else ""
+                            if not parent:
+                                raise RuntimeError("the Pawsey folder is the bucket itself")
+                            src_s, dst_s = loc, f"{parent}/{op['local_name']}"
+                            desc = f"rename on Pawsey: {loc} → {dst_s}"
+                            self._reconcile_log_bg(f"[{n}/{len(todo)}] {desc}")
+                            ok, out = do_remote_rename(src_s, dst_s, True)
+                        else:
+                            src_s = local_root
+                            dst_s = os.path.join(os.path.dirname(local_root), op["remote_name"])
+                            desc = f"rename locally: {src_s} → {dst_s}"
+                            self._reconcile_log_bg(f"[{n}/{len(todo)}] {desc}")
+                            ok, out = do_local_rename(src_s, dst_s)
+                        logop = "reconcile_rename_root"
+                    else:   # rename_dir / rename_file
+                        is_dir = k == "rename_dir"
+                        if to_pawsey:
+                            src_s = remote_full(op["remote"])
+                            parent = op["remote"].rpartition("/")[0]
+                            dst_s = remote_full((parent + "/" if parent else "") + op["local_name"])
+                            desc = f"rename on Pawsey: {op['remote']} → …/{op['local_name']}"
+                            self._reconcile_log_bg(f"[{n}/{len(todo)}] {desc}")
+                            ok, out = do_remote_rename(src_s, dst_s, is_dir)
+                        else:
+                            src_s = local_full(op["local"])
+                            parent = op["local"].rpartition("/")[0]
+                            dst_s = local_full((parent + "/" if parent else "") + op["remote_name"])
+                            desc = f"rename locally: {op['local']} → …/{op['remote_name']}"
+                            self._reconcile_log_bg(f"[{n}/{len(todo)}] {desc}")
+                            ok, out = do_local_rename(src_s, dst_s)
+                        logop = f"reconcile_{k}"
+                except Exception as e:
+                    ok, out = False, str(e)
+                    logop, src_s, dst_s = f"reconcile_{k}", "", ""
+                if ok:
+                    done_n += 1
+                    op["status"] = "✓ done"
+                    self._reconcile_log_bg("    ✓ done")
+                else:
+                    fail_n += 1
+                    op["status"] = f"✗ {out[:160]}"
+                    self._reconcile_log_bg(f"    ✗ FAILED: {out[:300]}")
+                self._append_log({
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "operation": logop, "source": src_s, "destination": dst_s,
+                    "local_root": local_root, "pawsey_root": loc,
+                    "direction": "pawsey" if to_pawsey else "local",
+                    "notes": notes, "status": "completed" if ok else "failed",
+                    "detail": "" if ok else out[:500],
+                })
+                self._bg_queue.put((lambda _r, _e, i=i, v=n: (
+                    self._reconcile_update_row(i),
+                    self.rec_progress.configure(value=v)), None, None))
+            return done_n, fail_n
+
+        def done(result, err):
+            self._reconcile_set_busy(False)
+            self.rec_progress.configure(maximum=100, value=100)
+            if err:
+                self._reconcile_log(f"✗ {err}")
+                messagebox.showerror(APP_NAME, f"Apply failed:\n{err}")
+                return
+            done_n, fail_n = result
+            self._refresh_history()
+            msg = f"{done_n} action(s) applied"
+            if fail_n:
+                msg += f", {fail_n} failed (see the progress log)"
+            self._reconcile_log("— " + msg)
+            self.status_var.set("Rename / Match: " + msg)
+            self.rec_notes.delete("1.0", "end")
+            tip = ("\n\nNext: click 'Scan & compare' again to confirm both sides now "
+                   "match, then run your usual Transfer (Copy / Mirror) for the "
+                   "files that are genuinely new. If this pair uses Two-way sync, "
+                   "rebuild its baseline once (Transfer tab → 'Rebuild two-way "
+                   "baseline') so bisync learns the new names.")
+            if done_n and not fail_n:
+                messagebox.showinfo(APP_NAME, msg + "." + tip)
+            else:
+                messagebox.showwarning(APP_NAME, msg + "." + tip)
+            if hasattr(self, "storage_tree"):
+                try:
+                    self._storage_refresh_root()
+                except Exception:
+                    pass
+
+        self._bg_call(work, done)
+
     # ------------------------------------------------------------- Console
     def _build_console_tab(self) -> None:
         """A built-in command console for running rclone (or any) commands and
@@ -7897,6 +9167,53 @@ Stored in: {APP_DIR}
                            (used by 'Resume previous transfer…')
   - heartbeat.json       : liveness file for unattended runs
   - logs/                : per-transfer full rclone output
+
+RENAME / MATCH TAB  (v2.5) - renamed folders without re-uploading
+------------------------------------------------------------------
+Renamed a project, site or date folder on this PC after it had been
+uploaded (e.g. 2026_WonganHill_F -> 2026WonganHill_F, or 2026-07-08 ->
+20260708)? Every sync mode then sees a NEW folder locally and a MISSING
+one on Pawsey: Copy uploads everything again next to the old copy,
+Mirror deletes the old copy AND uploads everything again. Tens of
+gigabytes of identical raw data move for a name change.
+
+The Rename / Match tab fixes this:
+1. Pick the local project folder and the Pawsey folder it corresponds
+   to (bucket + path, e.g. dpird-appn-2026/2026_AcidTolerance_I_DPIRD -
+   its name may differ from the local one). "Use Transfer tab source &
+   destination" fills both in from the Transfer tab. If the PROJECT
+   folder itself was renamed and you are not sure what it is called on
+   Pawsey, pick the bucket and click 'Find on Pawsey by content…': every
+   folder in the bucket is checked and the one holding the same files is
+   filled in - the top-level rename then appears as a row of its own.
+2. Click 'Scan & compare'. Both sides are listed once (a few seconds
+   for ~10,000 files) and folders are paired by their CONTENTS: a
+   folder on each side holding the same file names with the same byte
+   sizes is the same folder, whatever it is called. Each proposed pair
+   is spot-checked with the MD5 of a few files against Pawsey's stored
+   hash, so a wrong pairing is caught before anything moves.
+3. Review the table. Tick/untick rows with the box in the first column
+   (or press Space). Double-click a row for the match details.
+     * Rename on Pawsey / locally - same data, different name.
+     * Remove partial copy      - a second copy under the NEW name
+       (typically an interrupted sync) whose files are ALL present in
+       the real folder; removing it frees the name. Unticked by default.
+     * Delete from Pawsey?      - a folder with no counterpart on this
+       PC. Unticked by default; only tick it if it really should go.
+     * Only on this PC          - new data; your next Transfer uploads it.
+     * Conflict                 - two copies that differ; sort out by hand.
+4. Choose the direction - rename on Pawsey to match this PC (the usual
+   case; a server-side move, no data transfer, seconds per folder) or
+   rename the local folders to match Pawsey - write a note, and click
+   'Apply ticked actions'.
+5. Scan again to confirm, then run your normal Transfer for the files
+   that are genuinely new. Two-way-sync pairs need their baseline
+   rebuilt once afterwards (Transfer tab) so bisync learns the names.
+
+Deletions follow the Transfer tab's recycle-bin setting: with the bin ON
+a removed folder goes to _recycle_bin/<timestamp>/ (recoverable); with
+it OFF the app asks for the password and deletes permanently. Every
+action is written to the transfer log with your note.
 
 Tips & troubleshooting
 ----------------------
