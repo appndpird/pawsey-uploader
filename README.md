@@ -265,7 +265,8 @@ so you can confirm which one you launched.
 
 | File | Version | Notes |
 |---|---|---|
-| `dist/PDMA-v2.5.exe` | **v2.5 (latest)** | **Rename / Match tab.** A project/site/date folder renamed on the PC after upload no longer re-uploads: the tab lists both sides once, pairs folders by contents (file names + sizes; MD5 spot-checks against Pawsey's stored hashes), and applies the renames as server-side moves on Pawsey (or renames the local folders to match). Flags partial duplicate copies left by an interrupted sync, lists folders only on one side, deletions honour the recycle-bin setting, everything is logged with a note |
+| `dist/PDMA-v2.5.1.exe` | **v2.5.1 (latest)** | Rename / Match: **live progress** while a folder is moved on Pawsey (a rename there is a server-side copy of every object - about 1 min per 6 GB - not an instant metadata change), the confirm dialog says how long to expect and to keep the app open, closing mid-move asks first, and a move that was cut short shows up on the next scan as a **"Finish rename on Pawsey"** row that moves the rest across |
+| `dist/PDMA-v2.5.exe` | v2.5 | **Rename / Match tab.** A project/site/date folder renamed on the PC after upload no longer re-uploads: the tab lists both sides once, pairs folders by contents (file names + sizes; MD5 spot-checks against Pawsey's stored hashes), and applies the renames as server-side moves on Pawsey (or renames the local folders to match). Flags partial duplicate copies left by an interrupted sync, lists folders only on one side, deletions honour the recycle-bin setting, everything is logged with a note |
 | `dist/PDMA-v2.4.exe` | v2.4 | **Storage tab lists big folders in seconds instead of timing out.** Plain `rclone lsjson` does one HEAD request per object on S3 to fetch the original mtime and MIME type; a folder of 8,400 images took 4.5 min, exceeded the browser's 2-min limit and was shown as *empty* ("Failed to list … Command timed out"). Listings now use `--use-server-modtime --no-mimetype` (2 s for the same folder; the Modified column shows the upload time) and the limit is 15 min |
 | `dist/PDMA-v2.3.1.exe` | v2.3.1 | **Diagnostics log** `~/.pawsey_uploader/app_errors.log`: every failing rclone call, every internal error (now also shown in a dialog instead of vanishing), and each app start with user, rclone path and version — send this file when reporting a problem |
 | `dist/PDMA-v2.3.exe` | v2.3 | **Empty folders that are themselves empty** (an empty `Documents/` uploaded, pasted, moved, sent or synced on its own) now exist on Pawsey and show on the Storage tab — previously rclone saw "nothing to transfer" and wrote no marker; a move of such a folder no longer makes it vanish; folder downloads create the local folder; **New folder** writes a folder marker instead of a `.keep` file; real runs now count folder creations ("Making directory") in the change summary |
@@ -279,7 +280,7 @@ so you can confirm which one you launched.
 | `dist/PawseyUploader-v1.4.exe` | v1.4 | Two-way sync, recycle bin, unattended operation |
 
 > Note: `PawseyUploader.exe` (no version suffix) is **not** the newest build —
-> it is the last release made under the old name (v1.9). Use `PDMA-v2.5.exe`.
+> it is the last release made under the old name (v1.9). Use `PDMA-v2.5.1.exe`.
 
 ### Rebuilding the `.exe` yourself
 
@@ -289,7 +290,7 @@ so you can confirm which one you launched.
 Build a single target from its spec instead, which touches only that one file:
 
 ```bat
-python -m PyInstaller PDMA-v2.5.spec --noconfirm --distpath dist
+python -m PyInstaller PDMA-v2.5.1.spec --noconfirm --distpath dist
 ```
 
 Use a **python.org / system Python**, not a conda env: PyInstaller in a conda
@@ -362,7 +363,14 @@ Pawsey stores for each object. The result is a table of actions you tick:
 | Only on this PC | new data — your next Transfer uploads it | info only |
 | Conflict | two copies that differ — sort out by hand | info only |
 
-Renames on Pawsey are server-side moves (seconds per folder, no transfer).
+Renames on Pawsey are server-side moves: object storage has no rename, so the
+storage copies every object to its new key and deletes the old one. Nothing is
+uploaded or downloaded, but it takes about 1 minute per 6 GB (a 110 GB site
+folder ~20 min); the progress log shows the running totals. Keep the app open
+until it reports done - a move cut short leaves the folder split between the
+two names, and the next scan offers a "Finish rename on Pawsey" row. If you
+want an instant result, choose the other direction: renaming the *local*
+folders to match Pawsey is immediate.
 Deletions obey the recycle-bin setting on the Transfer tab. Each action is
 logged with your note. Afterwards, scan again, then run the normal Transfer
 for the genuinely new files; a two-way-sync pair needs its baseline rebuilt

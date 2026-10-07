@@ -66,7 +66,7 @@ except Exception:  # pragma: no cover - logos are cosmetic
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Pawsey Data Management App (PDMA)"
-APP_VERSION = "2.5"
+APP_VERSION = "2.5.1"
 APP_TAGLINE = "DPIRD · APPN  |  Pawsey Acacia object storage manager"
 
 # ---------------------------------------------------------------------------
@@ -825,6 +825,36 @@ def _run_rclone_split(args: list[str], timeout: int = 3600):
         return 1, "", f"Error: {e}"
 
 
+def _run_rclone_stream(args: list[str], on_line, timeout: int = 86400) -> tuple:
+    """Run rclone and hand every output line to on_line(str) as it appears.
+    Used for server-side folder moves, which copy each object inside Pawsey
+    and take minutes for large folders: the stats lines keep the user
+    informed instead of leaving a silent, frozen-looking wait."""
+    tail: list = []
+    try:
+        proc = subprocess.Popen([RCLONE_EXE, *args], **_subprocess_kwargs())
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = ANSI_ESCAPE_RE.sub("", line.rstrip("\r\n"))
+            if not line.strip():
+                continue
+            tail.append(line)
+            if len(tail) > 200:
+                tail.pop(0)
+            try:
+                on_line(line)
+            except Exception:
+                pass
+        proc.wait(timeout=timeout)
+        return proc.returncode, "\n".join(tail)
+    except FileNotFoundError:
+        return 127, "rclone executable not found"
+    except subprocess.TimeoutExpired:
+        return 124, "Command timed out"
+    except Exception as e:
+        return 1, f"Error: {e}"
+
+
 class _TreeNode:
     """One folder of a local or Pawsey tree used by the matcher."""
     __slots__ = ("name", "path", "parent", "files", "dirs", "sig",
@@ -1024,17 +1054,44 @@ def _reconcile_trees(local: _TreeNode, remote: _TreeNode,
                 if how != "name":
                     continue
                 common, cont, _jac = _containment(ln.sig, rn.sig)
+                if not common or cont < threshold:
+                    continue
                 common0, _c0, _j0 = _containment(ln.sig, rn0.sig)
-                if common and cont >= threshold and common > common0:
+                # An INTERRUPTED rename (app closed mid-move, or still
+                # running) leaves two halves: the new-name folder holds the
+                # objects already moved, the old-name folder the rest, and
+                # together they make up the local folder. Finish the move
+                # instead of calling it a duplicate or a conflict - whichever
+                # half happens to be the bigger one.
+                _cl, cont0_in_local, _jl = _containment(rn0.sig, ln.sig)
+                overlap, _ov, _ovj = _containment(rn0.sig, rn.sig)
+                halves = (cont0_in_local >= threshold and (rn0.sig - rn.sig)
+                          and overlap < 0.5 * min(sum(rn0.sig.values()),
+                                                  sum(rn.sig.values())))
+                if halves or common > common0:
                     if best is None or common > best[0]:
-                        best = (common, cont, ln, rn0)
+                        best = (common, cont, ln, rn0, halves)
             if best is None:
                 continue
-            common, cont, ln, rn0 = best
+            common, cont, ln, rn0, halves = best
             rk.pop(rname)
             paired = [(a, b, h) for (a, b, h) in paired if b is not rn0]
-            paired.append((ln, rn, "content"))
             subset = not (rn0.sig - rn.sig)      # every file of the dup is in rn
+            if halves:
+                ops.append({
+                    "kind": "merge_dir", "local": ln.path, "remote": rn.path,
+                    "merge_into": rn0.path, "local_name": ln.name,
+                    "remote_name": rn.name, "nfiles": rn.nfiles,
+                    "nbytes": rn.nbytes, "common": common, "match": cont,
+                    "jaccard": 0.0, "how": "interrupted rename",
+                    "depth": rn.depth, "checked": True, "safe": True,
+                    "lnode": ln, "rnode": rn, "verify": "",
+                    "note": (f"finish an interrupted rename: move the "
+                             f"{rn.nfiles:,} file(s) still under '{rn.name}' "
+                             f"into '{rn0.name}' ({rn0.nfiles:,} already there); "
+                             f"scan again afterwards")})
+                continue
+            paired.append((ln, rn, "content"))
             ops.append({
                 "kind": "remove_dup" if subset else "conflict",
                 "local": "", "remote": rn0.path, "local_name": "",
@@ -7535,8 +7592,9 @@ function filt(q) {{
                     "checked": False, "safe": True, "lnode": ltree,
                     "rnode": rtree, "verify": "",
                     "note": "the two top-level folders themselves have different names"})
-            order = {"remove_dup": 0, "conflict": 1, "rename_root": 2, "rename_dir": 3,
-                     "rename_file": 4, "only_remote_dir": 5, "only_local_dir": 6}
+            order = {"remove_dup": 0, "conflict": 1, "merge_dir": 2, "rename_root": 2,
+                     "rename_dir": 3, "rename_file": 4, "only_remote_dir": 5,
+                     "only_local_dir": 6}
             ops.sort(key=lambda o: (order.get(o["kind"], 9), o["depth"], o["local"], o["remote"]))
             self._rec_ops = ops
             self._rec_stats = stats
@@ -7594,6 +7652,10 @@ function filt(q) {{
                           else "Rename local file")
                 local_col = f"{local_col}  →  {op['remote_name']}"
             tag = "rename" if op["safe"] else "bad"
+        elif k == "merge_dir":
+            action = "Finish rename on Pawsey"
+            pawsey_col = f"{op['remote']}  →  {op['merge_into']}"
+            tag = "rename"
         elif k == "remove_dup":
             action = "Remove partial copy on Pawsey"
             tag = "delete"
@@ -7612,7 +7674,7 @@ function filt(q) {{
             check = "☑" if op["checked"] else "☐"
         match = f"{op['match'] * 100:.0f}%" if op.get("match") else ""
         status = op.get("status", "")
-        if k in ("remove_dup", "conflict", "rename_root") and not status:
+        if k in ("remove_dup", "conflict", "rename_root", "merge_dir") and not status:
             status = op.get("note", "")
         return (check, action, local_col, pawsey_col, f"{op['nfiles']:,}",
                 human_bytes(op["nbytes"]), match, op.get("verify", ""), status, tag)
@@ -7668,7 +7730,7 @@ function filt(q) {{
             if op.get("status", "").startswith("✓"):
                 continue
             if on:
-                if op["kind"] in ("rename_dir", "rename_file") and op["safe"]:
+                if op["kind"] in ("rename_dir", "rename_file", "merge_dir") and op["safe"]:
                     op["checked"] = True
             else:
                 if op["kind"] not in ("only_local_dir", "conflict"):
@@ -7723,7 +7785,22 @@ function filt(q) {{
             msg += f"  • {action}: {pc if to_pawsey or op['kind'] != 'rename_dir' else lc}\n"
         if len(todo) > 14:
             msg += f"  … and {len(todo) - 14} more\n"
-        if not to_pawsey:
+        if to_pawsey:
+            ren_paths = [o["local"] for _i, o in todo if o["kind"] == "rename_dir" and o["local"]]
+            big = sum(o["nbytes"] for _i, o in todo
+                      if o["kind"] in ("rename_dir", "rename_root", "merge_dir")
+                      and not any(o["local"].startswith(p + "/") for p in ren_paths
+                                  if p != o["local"]))
+            mins = max(1, int(big / (100 * 1024 ** 2) / 60 + 0.5))
+            msg += (f"\nA rename on Pawsey is a server-side move: the storage copies "
+                    f"each object to its new key, then deletes the old one. Nothing "
+                    f"is downloaded or uploaded, but it is not instant - roughly "
+                    f"1 minute per 6 GB. These actions cover {human_bytes(big)}, "
+                    f"so expect about {mins} minute(s). Progress is shown below.\n"
+                    f"KEEP THE APP OPEN until it reports done: closing it mid-move "
+                    f"leaves the folder split between the old and new names (the "
+                    f"next scan offers to finish the move).\n")
+        else:
             msg += "\nLocal renames use the operating system's rename (instant).\n"
         msg += "\nContinue?"
         if not messagebox.askyesno("Confirm Rename / Match",
@@ -7743,7 +7820,7 @@ function filt(q) {{
         # Deepest first, so a child is renamed while its parent still has
         # the old name (paths stay valid without any bookkeeping). Duplicate
         # removals go before the rename that needs the name freed.
-        order = {"remove_dup": 0, "only_remote_dir": 0, "rename_file": 1,
+        order = {"remove_dup": 0, "only_remote_dir": 0, "merge_dir": 1, "rename_file": 1,
                  "rename_dir": 1, "rename_root": 2}
         todo.sort(key=lambda t: (-t[1]["depth"], order.get(t[1]["kind"], 5)))
 
@@ -7767,20 +7844,40 @@ function filt(q) {{
                 return None
             return any(ln.strip() for ln in out.splitlines())
 
+        def move_folder(src: str, dest: str) -> tuple:
+            """Server-side folder move with live stats in the progress log."""
+            run_rclone_capture(["mkdir", dest, "--s3-no-check-bucket",
+                                S3_MARKER_FLAG], timeout=120)
+            last = {"t": 0.0}
+
+            def on_line(line: str):
+                # rclone prints one stats line every few seconds; show it,
+                # but throttle so a chatty run can't flood the log
+                import time as _t
+                now = _t.monotonic()
+                if "Transferred:" in line or "ERROR" in line or "Checks:" in line:
+                    if now - last["t"] >= 4 or "ERROR" in line:
+                        last["t"] = now
+                        self._reconcile_log_bg("        " + line.strip())
+
+            rc, out = _run_rclone_stream(
+                ["move", src, dest, "--delete-empty-src-dirs", *EMPTY_DIR_FLAGS,
+                 "--s3-no-check-bucket", f"--checkers={self.cfg.get('checkers', 16)}",
+                 "--transfers=8", "--stats=5s", "--stats-one-line"],
+                on_line, timeout=86400)
+            if rc == 0:
+                self._purge_empty_prefix(src)
+            return rc == 0, out.strip()[-400:]
+
         def do_remote_rename(src: str, dest: str, is_dir: bool) -> tuple:
             if is_dir:
                 has = remote_has_content(dest)
                 if has:
-                    return False, "target folder already exists on Pawsey and is not empty"
-                run_rclone_capture(["mkdir", dest, "--s3-no-check-bucket",
-                                    S3_MARKER_FLAG], timeout=120)
-                rc, out = run_rclone_capture(
-                    ["move", src, dest, "--delete-empty-src-dirs", *EMPTY_DIR_FLAGS,
-                     "--s3-no-check-bucket", f"--checkers={self.cfg.get('checkers', 16)}",
-                     "--transfers=8"], timeout=86400)
-                if rc == 0:
-                    self._purge_empty_prefix(src)
-                return rc == 0, out.strip()[-400:]
+                    return False, ("target folder already exists on Pawsey and is "
+                                   "not empty - scan again; if it is the other half "
+                                   "of an interrupted rename you will be offered "
+                                   "'Finish rename'")
+                return move_folder(src, dest)
             rc, out = run_rclone_capture(
                 ["moveto", src, dest, "--s3-no-check-bucket"], timeout=86400)
             return rc == 0, out.strip()[-400:]
@@ -7820,6 +7917,13 @@ function filt(q) {{
                         ok, out = do_remote_delete(path, op["remote"])
                         logop = "reconcile_recycle" if soft else "reconcile_delete"
                         src_s, dst_s = path, ""
+                    elif k == "merge_dir":
+                        src_s = remote_full(op["remote"])
+                        dst_s = remote_full(op["merge_into"])
+                        desc = f"finish rename on Pawsey: {op['remote']} → {op['merge_into']}"
+                        self._reconcile_log_bg(f"[{n}/{len(todo)}] {desc}")
+                        ok, out = move_folder(src_s, dst_s)
+                        logop = "reconcile_merge_dir"
                     elif k == "rename_root":
                         if to_pawsey:
                             parent = loc.rpartition("/")[0] if "/" in loc.partition(":")[2] else ""
@@ -9210,6 +9314,14 @@ The Rename / Match tab fixes this:
    that are genuinely new. Two-way-sync pairs need their baseline
    rebuilt once afterwards (Transfer tab) so bisync learns the names.
 
+How long it takes: a rename on Pawsey is a server-side move - the storage
+copies every object to its new key and deletes the old one. Nothing is
+uploaded or downloaded, but it is not instant: about 1 minute per 6 GB
+(a 110 GB site folder takes ~20 minutes). The progress log shows rclone's
+running totals. KEEP THE APP OPEN until it reports done. If a move is
+cut short the folder is split between the two names; the next scan shows
+a 'Finish rename on Pawsey' row that moves the rest across.
+
 Deletions follow the Transfer tab's recycle-bin setting: with the bin ON
 a removed folder goes to _recycle_bin/<timestamp>/ (recoverable); with
 it OFF the app asks for the password and deletes permanently. Every
@@ -9252,6 +9364,15 @@ Built for Pawsey Acacia uploads. Free to adapt.
 
     # ------------------------------------------------------------- Close
     def _on_close(self) -> None:
+        if getattr(self, "_rec_busy", False):
+            if not messagebox.askyesno(
+                    APP_NAME,
+                    "Rename / Match is still moving folders on Pawsey. Closing "
+                    "now leaves a folder split between its old and new names "
+                    "(a later scan can finish the move, but nothing else "
+                    "should touch it meanwhile).\n\nClose anyway?",
+                    icon="warning"):
+                return
         if self.transfer_active:
             if not messagebox.askyesno(
                 APP_NAME,
